@@ -14,7 +14,12 @@ SCRIPT = ROOT / "skills" / "consensus-rnd-spec" / "scripts" / "native_backend.sh
 
 class NativeBackendTests(unittest.TestCase):
     def test_native_plan_requires_opt_in(self) -> None:
-        result = subprocess.run(["bash", str(SCRIPT), "plan"], cwd=ROOT, capture_output=True, text=True, check=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+            result = subprocess.run(["bash", str(SCRIPT), "plan"], cwd=repo, env=env, capture_output=True, text=True, check=False)
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["status"], "blocked")
@@ -27,7 +32,7 @@ class NativeBackendTests(unittest.TestCase):
             scripts = skill / "scripts"
             scripts.mkdir(parents=True)
             (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
-            spawn = scripts / "spawn-codex.sh"
+            spawn = scripts / "consensus-rnd-cli"
             spawn.write_text("#!/usr/bin/env bash\necho \"$@\" > \"$REPO_ROOT/spawn.args\"\n", encoding="utf-8")
             spawn.chmod(0o755)
             env_dir = repo / ".consensus-rnd-spec"
@@ -42,6 +47,7 @@ class NativeBackendTests(unittest.TestCase):
             result = subprocess.run(["bash", str(SCRIPT), "run"], cwd=repo, env=env, capture_output=True, text=True, check=False)
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("spawn-codex", (repo / "spawn.args").read_text(encoding="utf-8"))
             self.assertIn("--prompt", (repo / "spawn.args").read_text(encoding="utf-8"))
 
 

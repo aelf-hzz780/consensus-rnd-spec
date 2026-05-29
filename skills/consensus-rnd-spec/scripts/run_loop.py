@@ -124,11 +124,14 @@ def loop_turn(repo: Path, *, execute: bool) -> dict[str, Any]:
                 if not execute:
                     break
     elif backend["backend"] == "native":
-        plan = native_plan(config)
-        item = {"plan": plan}
-        if execute and plan.get("status") == "ready":
-            item["execution"] = run_native(config)
-        turn["dispatches"].append(item)
+        for _ in range(max(1, missing)):
+            plan = native_plan(config)
+            item = {"plan": plan}
+            if execute and plan.get("status") == "ready":
+                item["execution"] = run_native(config)
+            turn["dispatches"].append(item)
+            if not execute:
+                break
     else:
         turn["dispatches"].append({"status": "blocked", "reason": backend["reason"]})
 

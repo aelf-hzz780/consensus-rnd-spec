@@ -35,11 +35,7 @@ def parse_intake(text: str) -> dict[str, Any]:
     instructions = collapse_ws(SURFACE_RE.sub(" ", without_loop))
     synthetic_human = ""
     if instructions:
-        human_index = instructions.find("Human:")
-        if human_index >= 0:
-            synthetic_human = f"Human: {instructions[human_index + len('Human:') :].strip()}"
-        else:
-            synthetic_human = f"Human: {instructions}"
+        synthetic_human = f"Human: {instructions}"
     return {
         "raw_text": text,
         "duration": duration,
@@ -94,7 +90,7 @@ def plan_intake(repo: Path, text: str) -> dict[str, Any]:
         "backend": backend,
         "seed": None,
     }
-    if parsed["synthetic_human"] and backend.get("backend") == "spec-kitty" and config.synthetic_human_intake_enable:
+    if parsed["synthetic_human"] and config.synthetic_human_intake_enable:
         title = title_from_intake(parsed)
         body = body_from_intake(parsed, backend)
         plan["seed"] = {
@@ -104,6 +100,7 @@ def plan_intake(repo: Path, text: str) -> dict[str, Any]:
             "source": "synthetic_human_intake",
             "mission_type": config.spec_kitty_mission_type,
             "evidence_hash": evidence_hash(title + "\n" + body),
+            "handoff": "spec-kitty" if backend.get("backend") == "spec-kitty" else "artifact-only",
         }
     return plan
 

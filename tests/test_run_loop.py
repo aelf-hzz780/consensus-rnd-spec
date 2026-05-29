@@ -34,9 +34,10 @@ class RunLoopTests(unittest.TestCase):
                 "status": "ready",
                 "action_command": ["spec-kitty", "agent", "action", "implement", "WP01"],
             }
-            with mock.patch("backend_common.spec_kitty_callable", return_value=True), mock.patch(
-                "run_loop.plan_next", return_value=plan
-            ), mock.patch("run_loop.count_inflight", return_value=5):
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("run_loop.plan_next", return_value=plan), mock.patch("run_loop.count_inflight", return_value=5):
                 turn = run_loop.loop_turn(repo, execute=False)
 
             event_path = repo / ".consensus-rnd-spec" / "state" / "loop-events.jsonl"
@@ -54,6 +55,30 @@ class RunLoopTests(unittest.TestCase):
 
         self.assertEqual(turn["backend"]["backend"], "native")
         self.assertEqual(turn["dispatches"][0]["plan"]["status"], "blocked")
+
+    def test_native_execute_fills_missing_floor_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\n'
+                'export CODEX_FLOOR="4"\n'
+                'export NATIVE_FULL_LOOP_ENABLE="true"\n'
+                'export NATIVE_CONSENSUS_SKILL_ROOT="/native-skill"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "native", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("run_loop.count_inflight", return_value=1), mock.patch(
+                "run_loop.native_plan", return_value={"backend": "native", "status": "ready"}
+            ), mock.patch("run_loop.run_native", return_value={"status": "spawned"}):
+                turn = run_loop.loop_turn(repo, execute=True)
+
+        self.assertEqual(turn["backend"]["backend"], "native")
+        self.assertEqual(turn["concurrency"]["missing"], 3)
+        self.assertEqual(len(turn["dispatches"]), 3)
+        self.assertEqual(turn["dispatches"][0]["execution"]["status"], "spawned")
 
     def test_execute_discovery_needed_writes_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

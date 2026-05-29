@@ -35,7 +35,7 @@ For `/loop <duration>` or an unattended run:
 
 `Human: ...` synthetic prompts are allowed only as `synthetic_human_intake`. They must never be treated as maintainer approval, GitHub comment authorship, or permission to bypass Spec Kitty gates.
 
-Use `intake.py` for slash-style prompts such as `/loop 10min /codex-refactor-loop ...`. It parses the duration and compatibility surface, then records the remaining prompt as `synthetic_human_intake` for Spec Kitty repositories. Use `run_loop.py` as the lower-level executable loop surface. Default mode is dry-run planning; `--execute` is required before it writes intake seeds, starts Spec Kitty actions, native delegation, or Codex workers.
+Use `intake.py` for slash-style prompts such as `/loop 10min /codex-refactor-loop ...`. It parses the duration and compatibility surface, then records the remaining prompt as `synthetic_human_intake`; Spec Kitty repositories can promote that seed into a mission, while native repositories keep it as an artifact-only intake unless their native backend consumes it. Use `run_loop.py` as the lower-level executable loop surface. Default mode is dry-run planning; `--execute` is required before it writes intake seeds, starts Spec Kitty actions, native delegation, or Codex workers.
 
 ## Spec Kitty Backend
 
@@ -54,8 +54,8 @@ When `native` is selected:
 
 - Require `NATIVE_FULL_LOOP_ENABLE=true`.
 - Require `NATIVE_CONSENSUS_SKILL_ROOT` to point at an installed `codex-refactor-loop` skill root.
-- Delegate to the native controller through its `scripts/spawn-codex.sh`; do not duplicate its lifecycle logic.
-- Preserve the host repository's push rules: never push to `main` or `master`; target remote and branch must be explicit.
+- Delegate to the native controller through `scripts/consensus-rnd-cli spawn-codex`; do not duplicate its lifecycle logic.
+- Preserve the host repository's push rules: never push to `main` or `master`; target remote and branch must be explicit and confirmed in the current session.
 
 ## Commands
 

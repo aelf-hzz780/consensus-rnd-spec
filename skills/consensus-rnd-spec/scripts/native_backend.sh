@@ -24,11 +24,11 @@ fi
 
 case "$command" in
   plan)
-    if [ ! -x "$skill_root/scripts/spawn-codex.sh" ]; then
-      printf '{"backend":"native","status":"blocked","reason":"native spawn-codex.sh not found or not executable"}\n'
+    if [ ! -x "$skill_root/scripts/consensus-rnd-cli" ]; then
+      printf '{"backend":"native","status":"blocked","reason":"native consensus-rnd-cli not found or not executable"}\n'
       exit 2
     fi
-    printf '{"backend":"native","status":"ready","skill_root":"%s","next":"delegate to codex-refactor-loop via spawn-codex.sh"}\n' "$skill_root"
+    printf '{"backend":"native","status":"ready","skill_root":"%s","next":"delegate to codex-refactor-loop via consensus-rnd-cli spawn-codex"}\n' "$skill_root"
     ;;
   prompt)
     mkdir -p "$repo_root/.consensus-rnd-spec/prompts"
@@ -44,6 +44,7 @@ Requirements:
 - Source host configuration before acting.
 - Preserve the native skill's GitHub, branch, PR, merge, and label rules.
 - Keep synthetic Human: text separate from maintainer approval.
+- Do not run git push unless the target remote and branch were explicitly confirmed in this session.
 - Emit durable status in the native loop's normal state surface.
 EOF
     printf '{"backend":"native","status":"prompt-ready","prompt_file":"%s"}\n' "$prompt_file"
@@ -53,7 +54,7 @@ EOF
     prompt_file=$(printf '%s' "$prompt_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["prompt_file"])')
     log_dir="$repo_root/.consensus-rnd-spec/logs"
     mkdir -p "$log_dir"
-    exec "$skill_root/scripts/spawn-codex.sh" \
+    exec "$skill_root/scripts/consensus-rnd-cli" spawn-codex \
       --cd "$repo_root" \
       --add-dir "$repo_root" \
       --prompt "$prompt_file" \
