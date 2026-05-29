@@ -85,9 +85,12 @@ class RunLoopTests(unittest.TestCase):
             repo = Path(tmp)
             (repo / "kitty-specs").mkdir()
             plan = {"backend": "spec-kitty", "status": "discovery_needed"}
-            with mock.patch("backend_common.spec_kitty_callable", return_value=True), mock.patch(
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("backend_common.spec_kitty_callable", return_value=True), mock.patch(
                 "run_loop.plan_next", return_value=plan
-            ), mock.patch("run_loop.count_inflight", return_value=0), mock.patch(
+            ), mock.patch("run_loop.count_inflight", return_value=5), mock.patch(
                 "discovery.rg_findings", return_value=[]
             ), mock.patch(
                 "discovery.large_python_files", return_value=[]
@@ -109,7 +112,10 @@ class RunLoopTests(unittest.TestCase):
                 encoding="utf-8",
             )
             plan = {"backend": "spec-kitty", "status": "discovery_needed"}
-            with mock.patch("backend_common.spec_kitty_callable", return_value=True), mock.patch(
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("backend_common.spec_kitty_callable", return_value=True), mock.patch(
                 "run_loop.plan_next", return_value=plan
             ), mock.patch("run_loop.count_inflight", return_value=0):
                 turn = run_loop.loop_turn(repo, execute=False)
