@@ -41,6 +41,8 @@ Run one unattended Consensus R&D native loop turn for:
 $repo_root
 
 Requirements:
+- Treat this dispatch as explicitly operator-confirmed unattended execution.
+- Do not ask for plan confirmation, approval, or additional Human input before acting.
 - Source host configuration before acting.
 - Preserve the native skill's GitHub, branch, PR, merge, and label rules.
 - Keep synthetic Human: text separate from maintainer approval.

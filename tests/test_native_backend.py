@@ -50,6 +50,30 @@ class NativeBackendTests(unittest.TestCase):
             self.assertIn("spawn-codex", (repo / "spawn.args").read_text(encoding="utf-8"))
             self.assertIn("--prompt", (repo / "spawn.args").read_text(encoding="utf-8"))
 
+    def test_native_prompt_declares_unattended_execution_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            skill = Path(tmp) / "native-skill"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
+            env_dir = repo / ".consensus-rnd-spec"
+            env_dir.mkdir()
+            (env_dir / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport NATIVE_FULL_LOOP_ENABLE="true"\nexport NATIVE_CONSENSUS_SKILL_ROOT="{skill}"\n',
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+
+            result = subprocess.run(["bash", str(SCRIPT), "prompt"], cwd=repo, env=env, capture_output=True, text=True, check=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prompt_path = Path(json.loads(result.stdout)["prompt_file"])
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("explicitly operator-confirmed unattended execution", prompt)
+            self.assertIn("Do not ask for plan confirmation", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

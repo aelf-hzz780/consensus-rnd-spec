@@ -5,3 +5,4 @@ __pycache__/
 .mypy_cache/
 .consensus-rnd-spec/
 .refactor-loop/
+.worktrees/
