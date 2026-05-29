@@ -1,0 +1,34 @@
+{
+  "name": "consensus-rnd-spec",
+  "version": "0.1.0",
+  "description": "Consensus R&D loop with Spec Kitty and native consensus backends",
+  "author": {
+    "name": "aelf"
+  },
+  "homepage": "https://github.com/ChronoAIProject/consensus-rnd",
+  "repository": "https://github.com/ChronoAIProject/consensus-rnd",
+  "license": "MIT",
+  "keywords": [
+    "consensus",
+    "spec-kitty",
+    "codex",
+    "orchestration",
+    "autonomous"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Consensus R&D Spec",
+    "shortDescription": "Unattended Consensus R&D with Spec Kitty routing.",
+    "longDescription": "Runs a Consensus R&D controller that auto-detects whether a host repository uses Spec Kitty. Spec Kitty repositories route discovery into missions and work packages; other repositories may fall back to the native consensus-rnd loop when explicitly enabled.",
+    "developerName": "aelf",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "/loop 10min /consensus-rnd-spec keep the unattended Consensus R&D loop running for this repo."
+    ]
+  }
+}
