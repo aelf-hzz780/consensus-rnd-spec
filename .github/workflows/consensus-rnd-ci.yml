@@ -1,0 +1,85 @@
+name: consensus-rnd-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: consensus-rnd-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-tests:
+    name: contract-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile scripts
+        run: python3 -m py_compile skills/consensus-rnd-spec/scripts/*.py tests/*.py
+
+  manifest-version-sync:
+    name: manifest-version-sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check manifest version sync
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          mapping = json.loads((root / ".version-bump.json").read_text())
+          records = []
+          for entry in mapping["files"]:
+              document = json.loads((root / entry["path"]).read_text())
+              value = document
+              for segment in entry["field"].split("."):
+                  value = value[int(segment)] if isinstance(value, list) else value[segment]
+              records.append((entry["path"], entry["field"], value))
+          versions = {value for _, _, value in records}
+          if len(versions) != 1:
+              raise SystemExit(f"manifest versions are not synced: {records!r}")
+          print(f"MANIFEST_VERSION_SYNC_OK:{next(iter(versions))}")
+          PY
+
+  skill-degradation:
+    name: skill-degradation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout native backend
+        uses: actions/checkout@v4
+        with:
+          repository: ChronoAIProject/consensus-rnd
+          path: .native-backend/consensus-rnd
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run native skill degradation checker
+        run: python3 .native-backend/consensus-rnd/skills/codex-refactor-loop/scripts/consensus-rnd-cli check-degradation --static --repo-root .native-backend/consensus-rnd
+
+      - name: Run host adapter degradation guards
+        run: python3 -m unittest tests.test_plugin_structure tests.test_native_backend -v
