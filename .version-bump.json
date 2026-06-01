@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": ".codex-plugin/plugin.json",
+      "field": "version"
+    }
+  ]
+}

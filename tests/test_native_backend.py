@@ -14,7 +14,12 @@ SCRIPT = ROOT / "skills" / "consensus-rnd-spec" / "scripts" / "native_backend.sh
 
 class NativeBackendTests(unittest.TestCase):
     def test_native_plan_requires_opt_in(self) -> None:
-        result = subprocess.run(["bash", str(SCRIPT), "plan"], cwd=ROOT, capture_output=True, text=True, check=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+            result = subprocess.run(["bash", str(SCRIPT), "plan"], cwd=repo, env=env, capture_output=True, text=True, check=False)
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["status"], "blocked")
@@ -27,7 +32,7 @@ class NativeBackendTests(unittest.TestCase):
             scripts = skill / "scripts"
             scripts.mkdir(parents=True)
             (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
-            spawn = scripts / "spawn-codex.sh"
+            spawn = scripts / "consensus-rnd-cli"
             spawn.write_text("#!/usr/bin/env bash\necho \"$@\" > \"$REPO_ROOT/spawn.args\"\n", encoding="utf-8")
             spawn.chmod(0o755)
             env_dir = repo / ".consensus-rnd-spec"
@@ -42,7 +47,83 @@ class NativeBackendTests(unittest.TestCase):
             result = subprocess.run(["bash", str(SCRIPT), "run"], cwd=repo, env=env, capture_output=True, text=True, check=False)
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("spawn-codex", (repo / "spawn.args").read_text(encoding="utf-8"))
             self.assertIn("--prompt", (repo / "spawn.args").read_text(encoding="utf-8"))
+
+    def test_native_plan_accepts_upstream_spawn_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            skill = Path(tmp) / "native-skill"
+            scripts = skill / "scripts"
+            scripts.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
+            (scripts / "spawn-codex.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            env_dir = repo / ".consensus-rnd-spec"
+            env_dir.mkdir()
+            (env_dir / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport NATIVE_FULL_LOOP_ENABLE="true"\nexport NATIVE_CONSENSUS_SKILL_ROOT="{skill}"\n',
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+
+            result = subprocess.run(["bash", str(SCRIPT), "plan"], cwd=repo, env=env, capture_output=True, text=True, check=False)
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["entrypoint"], "spawn-wrapper")
+
+    def test_native_run_delegates_to_upstream_spawn_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            skill = Path(tmp) / "native-skill"
+            scripts = skill / "scripts"
+            scripts.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
+            spawn = scripts / "spawn-codex.sh"
+            spawn.write_text("#!/usr/bin/env bash\necho \"$@\" > \"$REPO_ROOT/spawn-wrapper.args\"\n", encoding="utf-8")
+            env_dir = repo / ".consensus-rnd-spec"
+            env_dir.mkdir()
+            (env_dir / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport NATIVE_FULL_LOOP_ENABLE="true"\nexport NATIVE_CONSENSUS_SKILL_ROOT="{skill}"\n',
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+
+            result = subprocess.run(["bash", str(SCRIPT), "run"], cwd=repo, env=env, capture_output=True, text=True, check=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = (repo / "spawn-wrapper.args").read_text(encoding="utf-8")
+            self.assertIn("--prompt", args)
+            self.assertIn("--stall", args)
+
+    def test_native_prompt_declares_unattended_execution_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            skill = Path(tmp) / "native-skill"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
+            env_dir = repo / ".consensus-rnd-spec"
+            env_dir.mkdir()
+            (env_dir / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport NATIVE_FULL_LOOP_ENABLE="true"\nexport NATIVE_CONSENSUS_SKILL_ROOT="{skill}"\n',
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["REPO_ROOT"] = str(repo)
+
+            result = subprocess.run(["bash", str(SCRIPT), "prompt"], cwd=repo, env=env, capture_output=True, text=True, check=False)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prompt_path = Path(json.loads(result.stdout)["prompt_file"])
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("explicitly operator-confirmed unattended execution", prompt)
+            self.assertIn("Do not ask for plan confirmation", prompt)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
-for name in ("backend_common", "loop_check", "spec_backend", "discovery", "promote_discovery", "run_loop"):
+for name in ("backend_common", "loop_check", "spec_backend", "discovery", "promote_discovery", "native_capabilities", "run_loop"):
     spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -37,7 +37,7 @@ class IntakeTests(unittest.TestCase):
     def test_parse_slash_intake_normalizes_embedded_human_marker(self) -> None:
         parsed = intake.parse_intake("/loop 10min /codex-refactor-loop reload skills Human\uff1a fix bugs")
 
-        self.assertEqual(parsed["synthetic_human"], "Human: fix bugs")
+        self.assertEqual(parsed["synthetic_human"], "Human: reload skills Human: fix bugs")
 
     def test_plan_intake_creates_spec_kitty_seed_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,6 +53,21 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(plan["backend"]["backend"], "spec-kitty")
         self.assertEqual(plan["duration_seconds"], 600)
         self.assertEqual(plan["seed"]["source"], "synthetic_human_intake")
+        self.assertEqual(plan["seed"]["handoff"], "spec-kitty")
+
+    def test_plan_intake_creates_artifact_only_seed_for_native_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                intake,
+                "detect_backend",
+                return_value={"backend": "native", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ):
+                plan = intake.plan_intake(repo, "/loop 10min /codex-refactor-loop reload skills")
+
+        self.assertEqual(plan["backend"]["backend"], "native")
+        self.assertEqual(plan["seed"]["source"], "synthetic_human_intake")
+        self.assertEqual(plan["seed"]["handoff"], "artifact-only")
 
     def test_execute_writes_discovery_seed_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

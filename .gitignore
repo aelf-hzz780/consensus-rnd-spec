@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .consensus-rnd-spec/
+.refactor-loop/
+.worktrees/
