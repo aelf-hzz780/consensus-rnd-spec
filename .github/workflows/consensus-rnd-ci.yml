@@ -79,7 +79,16 @@ jobs:
           python-version: "3.12"
 
       - name: Run native skill degradation checker
-        run: python3 .native-backend/consensus-rnd/skills/codex-refactor-loop/scripts/consensus-rnd-cli check-degradation --static --repo-root .native-backend/consensus-rnd
+        run: |
+          skill_root=".native-backend/consensus-rnd/skills/codex-refactor-loop"
+          python3 skills/consensus-rnd-spec/scripts/native_capabilities.py --skill-root "$skill_root"
+          if [ -x "$skill_root/scripts/consensus-rnd-cli" ]; then
+            python3 "$skill_root/scripts/consensus-rnd-cli" check-degradation --static --repo-root .native-backend/consensus-rnd
+          else
+            test -f "$skill_root/scripts/spawn-codex.sh"
+            grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$skill_root/scripts/spawn-codex.sh"
+            grep -q 'SPAWN: prompt=' "$skill_root/scripts/spawn-codex.sh"
+          fi
 
       - name: Run host adapter degradation guards
         run: python3 -m unittest tests.test_plugin_structure tests.test_native_backend -v

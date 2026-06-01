@@ -10,7 +10,7 @@ from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
-for name in ("backend_common", "loop_check", "spec_backend", "discovery", "promote_discovery"):
+for name in ("backend_common", "loop_check", "spec_backend", "discovery", "promote_discovery", "native_capabilities"):
     spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader

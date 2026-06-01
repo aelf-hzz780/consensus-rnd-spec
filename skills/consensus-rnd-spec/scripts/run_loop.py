@@ -25,6 +25,7 @@ from loop_check import count_inflight
 from spec_backend import plan_next
 from discovery import produce as produce_discovery
 from promote_discovery import promote as promote_discovery
+from native_capabilities import detect_native_capabilities
 
 
 def skill_root() -> Path:
@@ -75,9 +76,9 @@ def native_plan(config) -> dict[str, Any]:
     if not config.native_full_loop_enable:
         return {"backend": "native", "status": "blocked", "reason": "NATIVE_FULL_LOOP_ENABLE is false"}
     skill_root_value = config.native_consensus_skill_root
-    if not skill_root_value or not (Path(skill_root_value) / "SKILL.md").exists():
+    if not skill_root_value:
         return {"backend": "native", "status": "blocked", "reason": "NATIVE_CONSENSUS_SKILL_ROOT is invalid"}
-    return {"backend": "native", "status": "ready", "skill_root": skill_root_value}
+    return detect_native_capabilities(skill_root_value)
 
 
 def run_native(config) -> dict[str, Any]:

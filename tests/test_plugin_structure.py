@@ -27,6 +27,7 @@ class PluginStructureTests(unittest.TestCase):
             "discovery.py",
             "intake.py",
             "loop_check.py",
+            "native_capabilities.py",
             "promote_discovery.py",
             "run_loop.py",
             "spec_backend.py",

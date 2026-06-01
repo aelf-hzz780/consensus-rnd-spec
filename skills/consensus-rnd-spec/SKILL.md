@@ -54,7 +54,7 @@ When `native` is selected:
 
 - Require `NATIVE_FULL_LOOP_ENABLE=true`.
 - Require `NATIVE_CONSENSUS_SKILL_ROOT` to point at an installed `codex-refactor-loop` skill root.
-- Delegate to the native controller through `scripts/consensus-rnd-cli spawn-codex`; do not duplicate its lifecycle logic.
+- Discover the native skill's supported entrypoint before dispatch. Prefer legacy `scripts/consensus-rnd-cli spawn-codex` when present, and otherwise delegate through upstream `scripts/spawn-codex.sh`. Do not duplicate native lifecycle logic in this adapter.
 - Preserve the host repository's push rules: never push to `main` or `master`; target remote and branch must be explicit and confirmed in the current session.
 
 ## Commands
@@ -75,3 +75,5 @@ When `native` is selected:
   `python3 <skill-root>/scripts/spec_backend.py plan --repo "$REPO_ROOT" --title "<title>"`
 - Check native fallback:
   `bash <skill-root>/scripts/native_backend.sh plan`
+- Inspect native backend compatibility:
+  `python3 <skill-root>/scripts/native_capabilities.py --skill-root "$NATIVE_CONSENSUS_SKILL_ROOT"`
