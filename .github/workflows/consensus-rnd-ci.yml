@@ -71,6 +71,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ChronoAIProject/consensus-rnd
+          ref: dev
           path: .native-backend/consensus-rnd
 
       - name: Set up Python
@@ -84,6 +85,17 @@ jobs:
           python3 skills/consensus-rnd-spec/scripts/native_capabilities.py --skill-root "$skill_root"
           if [ -x "$skill_root/scripts/consensus-rnd-cli" ]; then
             python3 "$skill_root/scripts/consensus-rnd-cli" check-degradation --static --repo-root .native-backend/consensus-rnd
+            python3 - <<'PY'
+            from pathlib import Path
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("native_capabilities", "skills/consensus-rnd-spec/scripts/native_capabilities.py")
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+            payload = module.detect_native_capabilities(Path(".native-backend/consensus-rnd/skills/codex-refactor-loop"))
+            assert payload["controller_surface"]["cli"]["supports_latest_controller"], payload
+            assert payload["controller_surface"]["wakeup_runner"]["exists"], payload
+            PY
           else
             test -f "$skill_root/scripts/spawn-codex.sh"
             grep -q -- '--dangerously-bypass-approvals-and-sandbox' "$skill_root/scripts/spawn-codex.sh"

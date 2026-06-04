@@ -57,6 +57,18 @@ class BackendCommonTests(unittest.TestCase):
 
         self.assertEqual(config.code_floor, 2)
         self.assertEqual(config.spec_kitty_scan_limit, 30)
+        self.assertEqual(config.kitty_flow_enforcement, "strict")
+
+    def test_invalid_kitty_flow_enforcement_defaults_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            config_dir = repo / ".consensus-rnd-spec"
+            config_dir.mkdir()
+            (config_dir / "host.env").write_text('KITTY_FLOW_ENFORCEMENT="unsafe"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                config = backend_common.load_config(repo)
+
+        self.assertEqual(config.kitty_flow_enforcement, "strict")
 
     def test_parse_duration_seconds(self) -> None:
         self.assertEqual(backend_common.parse_duration_seconds("10min", 1), 600)

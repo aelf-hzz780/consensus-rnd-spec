@@ -36,6 +36,27 @@ class NativeCapabilitiesTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ready")
         self.assertEqual(payload["entrypoint"], "legacy-cli")
 
+    def test_latest_controller_surface_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp)
+            scripts = skill / "scripts"
+            package = scripts / "codex_refactor_loop"
+            package.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("native skill\n", encoding="utf-8")
+            legacy = scripts / "consensus-rnd-cli"
+            legacy.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            legacy.chmod(0o755)
+            command_lines = "\n".join(f'    "{name}": CommandSpec(handler, "", ()), ' for name in native_capabilities.LATEST_CONTROLLER_COMMANDS)
+            (package / "cli.py").write_text(f"COMMANDS = {{\n{command_lines}\n}}\n", encoding="utf-8")
+            (package / "wakeup_runner.py").write_text("# runner\n", encoding="utf-8")
+
+            payload = native_capabilities.detect_native_capabilities(skill)
+
+        surface = payload["controller_surface"]
+        self.assertTrue(payload["supports_latest_controller"])
+        self.assertTrue(surface["cli"]["supports_latest_controller"])
+        self.assertTrue(surface["wakeup_runner"]["exists"])
+
     def test_spawn_wrapper_supports_upstream_main_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             skill = Path(tmp)

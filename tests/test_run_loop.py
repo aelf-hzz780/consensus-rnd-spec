@@ -80,6 +80,130 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(len(turn["dispatches"]), 3)
         self.assertEqual(turn["dispatches"][0]["execution"]["status"], "spawned")
 
+    def test_spec_kitty_strict_blocks_native_lifecycle_when_native_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs").mkdir()
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\n'
+                'export NATIVE_FULL_LOOP_ENABLE="true"\n'
+                'export NATIVE_CONSENSUS_SKILL_ROOT="/native-skill"\n'
+                'export KITTY_FLOW_ENFORCEMENT="strict"\n',
+                encoding="utf-8",
+            )
+            kitty_plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01"],
+            }
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("run_loop.count_inflight", return_value=5), mock.patch(
+                "run_loop.native_plan",
+                return_value={"backend": "native", "status": "ready", "entrypoint": "legacy-cli"},
+            ), mock.patch("run_loop.plan_next", return_value=kitty_plan), mock.patch(
+                "run_loop.execute_spec_kitty_action", return_value={"status": "kitty-action"}
+            ), mock.patch("run_loop.run_native") as run_native:
+                turn = run_loop.loop_turn(repo, execute=True)
+
+        self.assertEqual(turn["backend"]["backend"], "spec-kitty")
+        self.assertEqual(turn["native_companion"]["status"], "blocked")
+        self.assertIn("native-implementation", turn["native_companion"]["forbidden_actions"])
+        self.assertEqual(turn["dispatches"][0]["plan"]["status"], "ready")
+        run_native.assert_not_called()
+
+    def test_spec_kitty_execute_runs_one_state_machine_step_per_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs").mkdir()
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-next-step",
+                "advance_command": ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"],
+            }
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch(
+                "run_loop.detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch("run_loop.count_inflight", return_value=0), mock.patch(
+                "run_loop.plan_next", return_value=plan
+            ) as plan_next, mock.patch(
+                "run_loop.execute_spec_kitty_action", return_value={"status": "kitty-next-only"}
+            ):
+                turn = run_loop.loop_turn(repo, execute=True)
+
+        self.assertEqual(turn["concurrency"]["missing"], 5)
+        self.assertEqual(len(turn["dispatches"]), 1)
+        plan_next.assert_called_once()
+
+    def test_execute_kitty_next_step_runs_prompt_and_records_pending_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            prompt = repo / "kitty-prompt.md"
+            prompt.write_text("Implement the Spec Kitty discovery step.\n", encoding="utf-8")
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-next-step",
+                "chosen": {"mission": "001-demo"},
+                "advance_command": ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"],
+            }
+            next_stdout = json.dumps({"mission_slug": "001-demo", "action": "research", "prompt_file": str(prompt)})
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:2] == ["spec-kitty", "next"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": next_stdout, "stderr_tail": ""}
+                if command[:2] == ["codex", "exec"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run):
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+            pending_path = repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json"
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "worker-finished")
+        self.assertEqual(result["execution_kind"], "kitty-next-step")
+        self.assertEqual(pending["mission_slug"], "001-demo")
+        self.assertEqual(pending["result"], "success")
+        self.assertEqual(pending["completed_action"], "research")
+
+    def test_execute_kitty_agent_action_runs_stdout_prompt_and_records_pending_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "Implement WP01\n", "stderr_tail": ""}
+                if command[:2] == ["codex", "exec"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run):
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+            pending_path = repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json"
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "worker-finished")
+        self.assertEqual(result["execution_kind"], "kitty-agent-action")
+        self.assertEqual(pending["mission_slug"], "001-demo")
+        self.assertEqual(pending["completed_action"], "implement")
+
     def test_execute_discovery_needed_writes_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
