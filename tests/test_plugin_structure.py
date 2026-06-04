@@ -27,10 +27,12 @@ class PluginStructureTests(unittest.TestCase):
             "discovery.py",
             "intake.py",
             "loop_check.py",
+            "github_sync.py",
             "native_capabilities.py",
             "promote_discovery.py",
             "run_loop.py",
             "spec_backend.py",
+            "upstream_contract.py",
             "native_backend.sh",
         ):
             self.assertTrue((skill.parent / "scripts" / script).exists(), script)

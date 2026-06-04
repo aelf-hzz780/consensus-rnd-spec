@@ -23,6 +23,8 @@ This is a Strategy Pattern boundary. The controller owns scheduling, wakeups, fl
 
 When Spec Kitty is detected and `KITTY_FLOW_ENFORCEMENT=strict`, native `codex-refactor-loop` may be used only as a companion surface for capability detection, read-only status, or intake artifact production. It must not implement, review, merge, close issues, publish releases, or otherwise bypass Spec Kitty mission/WP lifecycle.
 
+When GitHub sync is enabled, GitHub is the operator-visible projection surface for Spec Kitty work: one mission maps to one parent tracking issue, one mission branch, and one mission PR; each WP maps to one managed child issue. Spec Kitty remains the source of truth for mission/WP lanes, worktrees, implementation, review, merge, and acceptance. GitHub issue/PR bodies and controller comments must use the upstream `crnd:*` label contract, status banner shape, and final standalone `⟦AI:AUTO-LOOP⟧` sentinel.
+
 ## Loop Contract
 
 For `/loop <duration>` or an unattended run:
@@ -51,6 +53,7 @@ When `spec-kitty` is selected:
 - If no mission has actionable WP work but a mission still has pre-WP `spec-kitty next` work, continue that mission before producing new discovery. If no mission has either pre-WP or WP work, promote the latest unpromoted `.consensus-rnd-spec/runs/discovery-*.json` into a Spec Kitty mission seed; if no discovery artifact exists, run the discovery producer first.
 - Record source metadata in mission artifacts: `source=consensus-rnd-spec`, source issue number when present, audit artifact path, evidence hash, and synthetic intake marker when applicable. After successful `spec-kitty specify`, write the promoted seed to `<mission>/consensus-rnd/intake.md` and `<mission>/consensus-rnd/intake.json`, and attach `consensus_rnd_spec` metadata in `<mission>/meta.json`.
 - For GitHub issue/PR intake, preserve `source_kind`, `source_issue`, `source_pr`, and `source_url` in both `<mission>/consensus-rnd/intake.json` and `<mission>/meta.json`.
+- If `GITHUB_SYNC_ENABLE=true` (default), promote mission state into GitHub through `github_sync.py`. On mission promotion, ensure or reuse the parent issue. After WP tasks exist, ensure one managed child issue per WP and write `<mission>/consensus-rnd/github-bindings.json`. During WP implement/review dispatch and completion, update the child issue phase label and post a controller status banner. When a mission branch can be resolved and has commits, open or reuse one mission PR whose body contains exactly one durable `Closes #<parent>` link. Default dry-run plans all GitHub operations; `--execute` performs them only after `gh` auth and repo slug preflight succeed.
 - The controller may keep `.consensus-rnd-spec/state/spec-kitty-pending-result.json` as a small handoff ledger for the last worker result only; it is not a mission state source and must be cleared after `spec-kitty next --result ...` accepts it.
 - Do not directly edit WP frontmatter, mutate Kitty lanes, or create worktrees outside Spec Kitty.
 - If `NATIVE_FULL_LOOP_ENABLE=true` is also set, keep native heavy-loop lifecycle blocked under `KITTY_FLOW_ENFORCEMENT=strict`; promote native/discovery intake into Spec Kitty missions and advance through `spec-kitty next`.
@@ -81,6 +84,10 @@ When `native` is selected:
   `python3 <skill-root>/scripts/discovery.py --repo "$REPO_ROOT"`
 - Promote discovery to Spec Kitty mission:
   `python3 <skill-root>/scripts/promote_discovery.py --repo "$REPO_ROOT" --execute`
+- Ensure GitHub WP issue bindings:
+  `python3 <skill-root>/scripts/github_sync.py ensure-children --repo "$REPO_ROOT" --mission "<mission-slug>" --execute`
+- Sync one WP status banner:
+  `python3 <skill-root>/scripts/github_sync.py sync-wp-status --repo "$REPO_ROOT" --mission "<mission-slug>" --wp-id WP01 --phase crnd:phase:implementing --execute`
 - Plan Spec Kitty handoff:
   `python3 <skill-root>/scripts/spec_backend.py plan --repo "$REPO_ROOT" --title "<title>"`
 - Check native fallback:

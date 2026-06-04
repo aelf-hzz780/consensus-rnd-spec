@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from backend_common import load_config, print_json, state_dir, utc_now
+from github_sync import ensure_parent_issue
 from spec_backend import evidence_hash
 
 
@@ -230,12 +231,16 @@ def promote(repo: Path, *, artifact: Path | None = None, execute: bool = False) 
     mission_slug = mission_slug_from_specify(specify, mission_dir)
     if specify["returncode"] == 0 and mission_dir is not None:
         mission_intake = write_mission_intake(mission_dir, seed, payload)
+    github_parent = None
+    if specify["returncode"] == 0 and mission_slug:
+        github_parent = ensure_parent_issue(config.repo_root, mission_slug, execute=execute)
     event = {
         "artifact": str(target),
         "evidence_hash": evidence,
         "title": title,
         "mission_slug": mission_slug,
         "mission_intake": mission_intake,
+        "github_parent": github_parent,
         "specify": specify,
         "status": "promoted" if specify["returncode"] == 0 else "failed",
     }
@@ -246,6 +251,7 @@ def promote(repo: Path, *, artifact: Path | None = None, execute: bool = False) 
         "specify": specify,
         "mission_slug": mission_slug,
         "mission_intake": mission_intake,
+        "github_parent": github_parent,
         "promotion_log": str(log_path),
     }
 

@@ -10,7 +10,7 @@ from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
-for name in ("backend_common", "loop_check", "spec_backend", "discovery", "promote_discovery", "native_capabilities"):
+for name in ("backend_common", "github_sync", "loop_check", "spec_backend", "discovery", "promote_discovery", "native_capabilities"):
     spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -203,6 +203,32 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(result["execution_kind"], "kitty-agent-action")
         self.assertEqual(pending["mission_slug"], "001-demo")
         self.assertEqual(pending["completed_action"], "implement")
+
+    def test_execute_kitty_agent_action_does_not_sync_github_when_action_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
+                    return {"command": command, "returncode": 1, "stdout_tail": "", "stderr_tail": "blocked"}
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch("run_loop.sync_wp_status") as sync:
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "action-command-only")
+        self.assertIsNone(result["github_before"])
+        sync.assert_not_called()
 
     def test_execute_discovery_needed_writes_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -31,6 +31,8 @@ class HostConfig:
     spec_kitty_mission: str
     spec_kitty_scan_limit: int
     kitty_flow_enforcement: str
+    github_sync_enable: bool
+    gh_repo_slug: str
     native_full_loop_enable: bool
     native_consensus_skill_root: str
     synthetic_human_intake_enable: bool
@@ -102,6 +104,8 @@ def load_config(repo: Path) -> HostConfig:
         spec_kitty_mission=env.get("SPEC_KITTY_MISSION", ""),
         spec_kitty_scan_limit=spec_kitty_scan_limit,
         kitty_flow_enforcement=kitty_flow_enforcement,
+        github_sync_enable=parse_bool(env.get("GITHUB_SYNC_ENABLE"), default=True),
+        gh_repo_slug=env.get("GH_REPO_SLUG", ""),
         native_full_loop_enable=parse_bool(env.get("NATIVE_FULL_LOOP_ENABLE"), default=False),
         native_consensus_skill_root=env.get("NATIVE_CONSENSUS_SKILL_ROOT", ""),
         synthetic_human_intake_enable=parse_bool(env.get("SYNTHETIC_HUMAN_INTAKE_ENABLE"), default=True),
