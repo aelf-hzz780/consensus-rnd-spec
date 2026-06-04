@@ -71,10 +71,31 @@ def unattended_worker_prompt(prompt_text: str) -> str:
         "The human already approved execution of this loop. Do not stop after producing a plan, "
         "do not ask for confirmation, and do not end until you have performed the requested work, "
         "run relevant verification, committed any required implementation changes, and completed "
-        "the Spec Kitty status commands from the prompt. If the work cannot be completed, return "
+        "the Spec Kitty status commands from the prompt. The process working directory is set to "
+        "the Spec Kitty workspace shown in the prompt, so relative edits must stay in that "
+        "workspace. If the work cannot be completed, return "
         "a clear failure with the blocker instead of reporting success.\n\n"
         f"{prompt_text}"
     )
+
+
+def worker_workspace_from_prompt(repo: Path, prompt_text: str) -> Path:
+    for raw_line in prompt_text.splitlines():
+        line = raw_line.strip()
+        candidate = ""
+        if line.startswith("Workspace:"):
+            candidate = line.split(":", 1)[1].strip()
+        elif "Workspace:" in line:
+            candidate = line.split("Workspace:", 1)[1].strip()
+        if candidate.startswith("cd "):
+            candidate = candidate[3:].strip()
+        if not candidate:
+            continue
+        candidate = candidate.strip("`\"'")
+        path = Path(candidate).expanduser()
+        if path.is_absolute() and path.is_dir():
+            return path
+    return repo
 
 
 def spec_kitty_site_packages() -> str:
@@ -284,8 +305,9 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
                     "action_result": action_result,
                     "github_before": github_before,
                 }
-        worker_command = codex_prompt_command(repo, unattended_worker_prompt(prompt_text), config)
-        worker_result = run_command(worker_command, repo)
+        worker_workspace = worker_workspace_from_prompt(repo, prompt_text)
+        worker_command = codex_prompt_command(worker_workspace, unattended_worker_prompt(prompt_text), config)
+        worker_result = run_command(worker_command, worker_workspace)
         worker_completed = kitty_agent_worker_success(repo, mission, wp_id, action, worker_result)
         effective_worker_result = dict(worker_result)
         exited_zero_without_transition = not worker_completed and worker_result.get("returncode") == 0
@@ -316,6 +338,7 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
             "execution_kind": execution_kind,
             "action_result": action_result,
             "worker_result": effective_worker_result,
+            "worker_workspace": str(worker_workspace),
             "pending_result": pending,
             "github_before": github_before,
             "github_after": github_after,

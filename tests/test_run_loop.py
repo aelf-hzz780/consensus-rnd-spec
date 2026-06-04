@@ -37,6 +37,19 @@ class RunLoopTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertNotIn("--ask-for-approval", command)
 
+    def test_worker_workspace_from_prompt_parses_lane_cd_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            lane = repo / ".worktrees" / "mission-lane-a"
+            lane.mkdir(parents=True)
+
+            workspace = run_loop.worker_workspace_from_prompt(
+                repo,
+                f"📍 Workspace: cd {lane}\nLane workspace: lane-a\n",
+            )
+
+        self.assertEqual(workspace, lane)
+
     def test_loop_turn_writes_event_in_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -187,6 +200,8 @@ class RunLoopTests(unittest.TestCase):
     def test_execute_kitty_agent_action_runs_stdout_prompt_and_records_pending_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
+            lane = repo / ".worktrees" / "demo-lane-a"
+            lane.mkdir(parents=True)
             plan = {
                 "backend": "spec-kitty",
                 "status": "ready",
@@ -199,8 +214,15 @@ class RunLoopTests(unittest.TestCase):
 
             def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
                 if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
-                    return {"command": command, "returncode": 0, "stdout_tail": "Implement WP01\n", "stderr_tail": ""}
+                    return {
+                        "command": command,
+                        "returncode": 0,
+                        "stdout_tail": f"Workspace: {lane}\nImplement WP01\n",
+                        "stderr_tail": "",
+                    }
                 if command[:2] == ["codex", "exec"]:
+                    self.assertEqual(_repo, lane)
+                    self.assertEqual(command[command.index("--cd") + 1], str(lane))
                     return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
                 if command[:3] == ["spec-kitty", "orchestrator-api", "mission-state"]:
                     return {
@@ -230,6 +252,7 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(result["execution_kind"], "kitty-agent-action")
         self.assertEqual(pending["mission_slug"], "001-demo")
         self.assertEqual(pending["completed_action"], "implement")
+        self.assertEqual(result["worker_workspace"], str(lane))
         self.assertEqual(sync.call_count, 2)
         pr_sync.assert_called_once_with(repo, "001-demo", execute=True)
 
