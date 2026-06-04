@@ -99,6 +99,10 @@ class GitHubSyncTests(unittest.TestCase):
             def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
                 if command[:3] == ["gh", "auth", "status"]:
                     return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "label", "list"]:
+                    return github_sync.CommandResult(command, 0, "[]", "")
+                if command[:3] == ["gh", "label", "create"]:
+                    return github_sync.CommandResult(command, 0, "", "")
                 if command[:3] == ["gh", "issue", "create"]:
                     return github_sync.CommandResult(command, 0, "https://github.com/owner/repo/issues/42\n", "")
                 raise AssertionError(command)
@@ -112,6 +116,57 @@ class GitHubSyncTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "created")
         self.assertEqual(bindings["parent_issue"]["number"], "42")
+
+    def test_label_catalog_dry_run_plans_without_gh_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(github_sync, "run_command") as run_command:
+                config = backend_common.load_config(repo)
+                result = github_sync.ensure_label_catalog(repo, config, execute=False)
+
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(len(result["commands"]), len(github_sync.LABEL_SPECS))
+        self.assertIn("crnd:lifecycle:managed", {command[3] for command in result["commands"]})
+        run_command.assert_not_called()
+
+    def test_label_catalog_execute_creates_missing_and_updates_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                calls.append(command)
+                if command[:3] == ["gh", "auth", "status"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "label", "list"]:
+                    existing = [{"name": github_sync.MANAGED}, {"name": github_sync.PHASE_IMPLEMENTING}]
+                    return github_sync.CommandResult(command, 0, json.dumps(existing), "")
+                if command[:3] in (["gh", "label", "create"], ["gh", "label", "edit"]):
+                    return github_sync.CommandResult(command, 0, "", "")
+                raise AssertionError(command)
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(github_sync.shutil, "which", return_value="/usr/bin/gh"), mock.patch.object(
+                github_sync, "run_command", side_effect=fake_run
+            ):
+                config = backend_common.load_config(repo)
+                result = github_sync.ensure_label_catalog(repo, config, execute=True)
+
+        self.assertEqual(result["status"], "ready")
+        self.assertIn(github_sync.MANAGED, result["updated"])
+        self.assertIn(github_sync.PHASE_IMPLEMENTING, result["updated"])
+        self.assertIn(github_sync.PHASE_CONSENSUS_REACHED, result["created"])
+        self.assertIn(github_sync.MANAGED, {command[3] for command in calls if command[:3] == ["gh", "label", "edit"]})
+        self.assertIn(github_sync.PHASE_CONSENSUS_REACHED, {command[3] for command in calls if command[:3] == ["gh", "label", "create"]})
 
     def test_ensure_child_issues_plans_one_issue_per_wp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,6 +210,54 @@ class GitHubSyncTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "blocked")
         self.assertIn("gh CLI not found", result["reason"])
+
+    def test_open_or_update_mission_pr_reuses_existing_pr_and_refreshes_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}, "WP02": {"number": "44"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                calls.append(command)
+                if command[:3] == ["gh", "pr", "list"]:
+                    payload = [{"number": 7, "url": "https://github.com/owner/repo/pull/7"}]
+                    return github_sync.CommandResult(command, 0, json.dumps(payload), "")
+                if command[:3] == ["gh", "pr", "edit"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "issue", "edit"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "issue", "comment"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                raise AssertionError(command)
+
+            preflight = {"status": "ready", "repo_slug": "owner/repo"}
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(github_sync, "resolve_mission_branch", return_value="kitty/001-demo"), mock.patch.object(
+                github_sync, "github_write_preflight", return_value=preflight
+            ), mock.patch.object(github_sync, "run_command", side_effect=fake_run):
+                result = github_sync.open_or_update_mission_pr(repo, "001-demo", execute=True)
+
+            body = (mission_dir / "consensus-rnd" / "github" / "mission-pr.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["mission_pr"]["number"], "7")
+        self.assertEqual(len(github_sync.PR_CLOSES_RE.findall(body)), 1)
+        self.assertIn("Closes #42", body)
+        self.assertFalse(any(command[:3] == ["gh", "pr", "create"] for command in calls))
+        self.assertTrue(any(command[:3] == ["gh", "pr", "edit"] and "--body-file" in command for command in calls))
 
 
 if __name__ == "__main__":

@@ -72,6 +72,36 @@ class CommandResult:
         }
 
 
+@dataclass(frozen=True)
+class LabelSpec:
+    name: str
+    description: str
+    color: str
+
+
+LABEL_SPECS = (
+    LabelSpec(MANAGED, "Item is managed by consensus-rnd-spec.", "ededed"),
+    LabelSpec("crnd:lifecycle:stuck", "Item is stalled and waiting for loop recovery.", "b60205"),
+    LabelSpec("crnd:lifecycle:no-framing", "Item has no actionable framing.", "d4c5f9"),
+    LabelSpec("crnd:triage:pending", "External issue is pending intake triage.", "fbca04"),
+    LabelSpec("crnd:triage:resume-requested", "Maintainer requested resumed implementation.", "1d76db"),
+    LabelSpec("crnd:milestone:current", "Milestone-priority item.", "f9d0c4"),
+    LabelSpec("crnd:milestone:release-target", "Release countdown target issue/PR.", "f9d0c4"),
+    LabelSpec(HUMAN_AUTO, "Controller may continue without maintainer intervention.", "bfd4f2"),
+    LabelSpec(HUMAN_MAINTAINER_DECISION, "Maintainer decision is required.", "b60205"),
+    LabelSpec(PHASE_DESIGN_SOLVING, "Consensus design solving is active.", "0e8a16"),
+    LabelSpec(PHASE_CONSENSUS_REACHED, "Consensus is reached and implementation is ready.", "1d76db"),
+    LabelSpec(PHASE_IMPLEMENTING, "Implementation worker is active.", "c5def5"),
+    LabelSpec(PHASE_PR_OPEN, "Pull request is open and awaiting review or CI routing.", "5319e7"),
+    LabelSpec(PHASE_REVIEWING, "Review workers are active.", "5319e7"),
+    LabelSpec(PHASE_FIXING, "Fix worker is active.", "d93f0b"),
+    LabelSpec(PHASE_CI_RUNNING, "CI watch is active.", "fbca04"),
+    LabelSpec(PHASE_BLOCKED, "Work is blocked or explicitly waiting.", "b60205"),
+    LabelSpec(PHASE_MERGED, "Work has landed.", "0e8a16"),
+    LabelSpec(PHASE_CLOSED, "Closed terminal protocol state without merged evidence.", "ededed"),
+)
+
+
 def mission_dir(repo: Path, mission: str) -> Path:
     return repo / "kitty-specs" / mission
 
@@ -267,6 +297,44 @@ def pr_comment_command(number: str, repo_slug: str, body_file: Path) -> list[str
     return ["gh", "pr", "comment", str(number), "--repo", repo_slug, "--body-file", str(body_file)]
 
 
+def pr_body_edit_command(number: str, repo_slug: str, body_file: Path) -> list[str]:
+    return ["gh", "pr", "edit", str(number), "--repo", repo_slug, "--body-file", str(body_file)]
+
+
+def label_list_command(repo_slug: str) -> list[str]:
+    return ["gh", "label", "list", "--repo", repo_slug, "--json", "name", "--limit", "1000"]
+
+
+def label_create_command(repo_slug: str, spec: LabelSpec) -> list[str]:
+    return [
+        "gh",
+        "label",
+        "create",
+        spec.name,
+        "--repo",
+        repo_slug,
+        "--description",
+        spec.description,
+        "--color",
+        spec.color,
+    ]
+
+
+def label_edit_catalog_command(repo_slug: str, spec: LabelSpec) -> list[str]:
+    return [
+        "gh",
+        "label",
+        "edit",
+        spec.name,
+        "--repo",
+        repo_slug,
+        "--description",
+        spec.description,
+        "--color",
+        spec.color,
+    ]
+
+
 def is_github_sync_enabled(config: HostConfig) -> bool:
     return config.github_sync_enable
 
@@ -336,6 +404,56 @@ def github_preflight(repo: Path, config: HostConfig, *, execute: bool) -> dict[s
     return payload
 
 
+def ensure_label_catalog(
+    repo: Path,
+    config: HostConfig,
+    *,
+    execute: bool = False,
+    preflight: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preflight = preflight or github_preflight(repo, config, execute=execute)
+    if preflight.get("status") in {"disabled", "blocked"}:
+        return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
+    repo_slug = planned_repo_slug(preflight, config)
+    planned = [label_create_command(repo_slug, spec) for spec in LABEL_SPECS]
+    if not execute:
+        return {"status": "planned", "preflight": preflight, "commands": planned}
+    listed = run_command(label_list_command(repo_slug), repo)
+    if listed.returncode != 0:
+        return {"status": "blocked", "reason": "failed to list GitHub labels", "result": listed.as_dict()}
+    try:
+        payload = json.loads(listed.stdout) if listed.stdout.strip() else []
+    except json.JSONDecodeError:
+        return {"status": "blocked", "reason": "invalid gh label list JSON", "result": listed.as_dict()}
+    existing = {str(item.get("name")) for item in payload if isinstance(item, dict) and item.get("name")}
+    results: list[dict[str, Any]] = [listed.as_dict()]
+    created: list[str] = []
+    updated: list[str] = []
+    for spec in LABEL_SPECS:
+        command = label_edit_catalog_command(repo_slug, spec) if spec.name in existing else label_create_command(repo_slug, spec)
+        result = run_command(command, repo)
+        results.append(result.as_dict())
+        if result.returncode != 0:
+            return {"status": "blocked", "reason": f"failed to sync label {spec.name}", "results": results}
+        if spec.name in existing:
+            updated.append(spec.name)
+        else:
+            created.append(spec.name)
+    return {"status": "ready", "created": created, "updated": updated, "results": results}
+
+
+def github_write_preflight(repo: Path, config: HostConfig, *, execute: bool = False) -> dict[str, Any]:
+    preflight = github_preflight(repo, config, execute=execute)
+    if preflight.get("status") in {"disabled", "blocked"}:
+        return preflight
+    labels = ensure_label_catalog(repo, config, execute=execute, preflight=preflight)
+    if labels.get("status") in {"disabled", "blocked"}:
+        return {"status": labels["status"], "reason": labels.get("reason"), "preflight": preflight, "labels": labels}
+    result = dict(preflight)
+    result["labels"] = labels
+    return result
+
+
 def planned_repo_slug(preflight: dict[str, Any], config: HostConfig) -> str:
     return str(preflight.get("repo_slug") or config.gh_repo_slug or "<repo-slug>")
 
@@ -378,7 +496,7 @@ def ensure_parent_issue(repo: Path, mission: str, *, execute: bool = False) -> d
     parent = bindings.get("parent_issue") if isinstance(bindings.get("parent_issue"), dict) else {}
     if parent.get("number"):
         return {"status": "ready", "parent_issue": parent, "bindings_path": str(bindings_path(path))}
-    preflight = github_preflight(config.repo_root, config, execute=execute)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     source = mission_source(path)
@@ -439,12 +557,13 @@ def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> d
     parent = ensure_parent_issue(config.repo_root, mission, execute=execute)
     if parent.get("status") in {"disabled", "blocked"}:
         return {"status": parent["status"], "reason": parent.get("reason"), "parent": parent}
+    bindings = load_bindings(path)
     parent_issue = parent.get("parent_issue", {}).get("number") or bindings.get("parent_issue", {}).get("number")
     if not parent_issue and not execute and parent.get("status") == "planned":
         parent_issue = "<parent_issue>"
     if not parent_issue:
         return {"status": "blocked", "reason": "missing parent issue", "parent": parent}
-    preflight = github_preflight(config.repo_root, config, execute=execute)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     repo_slug = planned_repo_slug(preflight, config)
@@ -517,7 +636,7 @@ def sync_wp_status(repo: Path, mission: str, wp_id: str, phase: str, *, detail: 
         child = bindings.get("child_issues", {}).get(wp_id) if isinstance(bindings.get("child_issues"), dict) else None
         if not isinstance(child, dict) or not child.get("number"):
             return {"status": "blocked", "reason": "missing child issue binding", "child_sync": child_sync}
-    preflight = github_preflight(config.repo_root, config, execute=execute)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     number = str(child["number"])
@@ -599,12 +718,14 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, execute: bool = False
     if not parent_issue:
         return {"status": "blocked", "reason": "missing parent issue", "parent": parent}
     child_sync = ensure_child_issues(config.repo_root, mission, execute=execute)
+    if child_sync.get("status") in {"disabled", "blocked"}:
+        return {"status": child_sync["status"], "reason": child_sync.get("reason"), "parent": parent, "child_sync": child_sync}
     bindings = load_bindings(path)
     base = target_branch_for_mission(path)
     head = resolve_mission_branch(config.repo_root, mission, base)
     if not head:
         return {"status": "blocked", "reason": "mission branch has no commits or cannot be resolved", "base": base}
-    preflight = github_preflight(config.repo_root, config, execute=execute)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     repo_slug = planned_repo_slug(preflight, config)
@@ -660,12 +781,13 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, execute: bool = False
         pr_url = created.stdout.strip()
     if not pr_number:
         return {"status": "blocked", "reason": "failed to parse mission PR number", "results": results}
+    pr_body = run_command(pr_body_edit_command(pr_number, repo_slug, body_file), config.repo_root)
     pr_labels = run_command(label_edit_command("pr", pr_number, repo_slug, PHASE_REVIEWING), config.repo_root)
     parent_labels = run_command(label_edit_command("issue", parent_issue, repo_slug, PHASE_PR_OPEN), config.repo_root)
     parent_banner = build_status_banner(phase=PHASE_PR_OPEN, mission=mission, issue=parent_issue, pr=pr_number, detail=f"Mission PR open from `{head}` to `{base}`.")
     parent_banner_file = write_body_file(path, "parent-pr-open-banner.md", parent_banner)
     parent_comment = run_command(issue_comment_command(parent_issue, repo_slug, parent_banner_file), config.repo_root)
-    results.extend([pr_labels.as_dict(), parent_labels.as_dict(), parent_comment.as_dict()])
+    results.extend([pr_body.as_dict(), pr_labels.as_dict(), parent_labels.as_dict(), parent_comment.as_dict()])
     if any(result["returncode"] != 0 for result in results):
         return {"status": "blocked", "reason": "failed to sync mission PR status", "results": results}
     bindings["mission_pr"] = {"number": pr_number, "url": pr_url, "head": head, "base": base}
@@ -678,7 +800,7 @@ def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> d
     config = load_config(repo)
     path = mission_dir(config.repo_root, mission)
     bindings = load_bindings(path)
-    preflight = github_preflight(config.repo_root, config, execute=execute)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     repo_slug = planned_repo_slug(preflight, config)
