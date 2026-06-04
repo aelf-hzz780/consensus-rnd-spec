@@ -39,8 +39,12 @@ def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def codex_base_command(repo: Path) -> list[str]:
+    return ["codex", "exec", "--cd", str(repo), "--dangerously-bypass-approvals-and-sandbox"]
+
+
 def codex_command(repo: Path, prompt_file: str, config) -> list[str]:
-    command = ["codex", "exec", "--cd", str(repo), "--ask-for-approval", "never"]
+    command = codex_base_command(repo)
     if config.codex_model:
         command.extend(["--model", config.codex_model])
     if config.codex_extra_args:
@@ -50,7 +54,7 @@ def codex_command(repo: Path, prompt_file: str, config) -> list[str]:
 
 
 def codex_prompt_command(repo: Path, prompt_text: str, config) -> list[str]:
-    command = ["codex", "exec", "--cd", str(repo), "--ask-for-approval", "never"]
+    command = codex_base_command(repo)
     if config.codex_model:
         command.extend(["--model", config.codex_model])
     if config.codex_extra_args:

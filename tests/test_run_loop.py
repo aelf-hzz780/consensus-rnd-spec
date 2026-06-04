@@ -25,6 +25,18 @@ RUN_SPEC.loader.exec_module(run_loop)
 
 
 class RunLoopTests(unittest.TestCase):
+    def test_codex_worker_command_uses_current_unattended_cli_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            prompt = repo / "prompt.md"
+            prompt.write_text("Run the worker.\n", encoding="utf-8")
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+
+            command = run_loop.codex_command(repo, str(prompt), config)
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--ask-for-approval", command)
+
     def test_loop_turn_writes_event_in_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
