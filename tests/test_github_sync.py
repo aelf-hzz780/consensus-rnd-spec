@@ -24,6 +24,10 @@ sys.modules["github_sync"] = github_sync
 SPEC.loader.exec_module(github_sync)
 
 
+def subprocess_completed(command: list[str], returncode: int, stdout: str, stderr: str):
+    return github_sync.subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
 def make_mission(repo: Path, mission: str = "001-demo", *, source_issue: str = "") -> Path:
     mission_dir = repo / "kitty-specs" / mission
     (mission_dir / "consensus-rnd").mkdir(parents=True)
@@ -40,6 +44,24 @@ def make_mission(repo: Path, mission: str = "001-demo", *, source_issue: str = "
 
 
 class GitHubSyncTests(unittest.TestCase):
+    def test_run_command_retries_transient_gh_eof(self) -> None:
+        calls = 0
+
+        def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return subprocess_completed(["gh", "label", "edit"], 1, "", "Patch url: EOF")
+            return subprocess_completed(["gh", "label", "edit"], 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(github_sync.subprocess, "run", side_effect=fake_run), mock.patch.object(
+            github_sync.time, "sleep"
+        ):
+            result = github_sync.run_command(["gh", "label", "edit"], Path(tmp))
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(calls, 2)
+
     def test_status_banner_shape_and_sentinel(self) -> None:
         body = github_sync.build_status_banner(
             phase=github_sync.PHASE_IMPLEMENTING,

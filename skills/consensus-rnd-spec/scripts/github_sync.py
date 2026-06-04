@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -339,11 +340,28 @@ def is_github_sync_enabled(config: HostConfig) -> bool:
     return config.github_sync_enable
 
 
+def transient_gh_error(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in text for marker in (" eof", "timeout", "timed out", "connection reset", "connection refused", "temporary failure"))
+
+
 def run_command(command: list[str], repo: Path) -> CommandResult:
+    attempts = 3 if command and command[0] == "gh" else 1
+    last: subprocess.CompletedProcess[str] | None = None
     try:
-        result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+        for attempt in range(attempts):
+            result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+            last = result
+            if not transient_gh_error(result) or attempt == attempts - 1:
+                break
+            time.sleep(0.5 * (attempt + 1))
     except FileNotFoundError as exc:
         return CommandResult(command=command, returncode=127, stdout="", stderr=str(exc))
+    result = last
+    if result is None:
+        return CommandResult(command=command, returncode=1, stdout="", stderr="command did not run")
     return CommandResult(command=command, returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
 

@@ -65,6 +65,18 @@ def codex_prompt_command(repo: Path, prompt_text: str, config) -> list[str]:
     return command
 
 
+def unattended_worker_prompt(prompt_text: str) -> str:
+    return (
+        "You are running inside an unattended consensus-rnd-spec worker. "
+        "The human already approved execution of this loop. Do not stop after producing a plan, "
+        "do not ask for confirmation, and do not end until you have performed the requested work, "
+        "run relevant verification, committed any required implementation changes, and completed "
+        "the Spec Kitty status commands from the prompt. If the work cannot be completed, return "
+        "a clear failure with the blocker instead of reporting success.\n\n"
+        f"{prompt_text}"
+    )
+
+
 def spec_kitty_site_packages() -> str:
     executable = shutil.which("spec-kitty")
     if not executable:
@@ -144,6 +156,35 @@ def wp_phase_for_action(action: str | None) -> str:
     if action == "review":
         return PHASE_REVIEWING
     return PHASE_IMPLEMENTING
+
+
+def wp_lane(repo: Path, mission: str, wp_id: str) -> str:
+    state = run_command(["spec-kitty", "orchestrator-api", "mission-state", "--mission", mission], repo)
+    try:
+        payload = json.loads(state.get("stdout_tail") or "{}")
+    except json.JSONDecodeError:
+        return ""
+    packages = payload.get("data", {}).get("work_packages", [])
+    if not isinstance(packages, list):
+        return ""
+    for package in packages:
+        if isinstance(package, dict) and package.get("wp_id") == wp_id:
+            lane = package.get("lane")
+            return str(lane) if lane else ""
+    return ""
+
+
+def kitty_agent_worker_success(repo: Path, mission: str, wp_id: str, action: str, worker_result: dict[str, Any]) -> bool:
+    if worker_result.get("returncode") != 0:
+        return False
+    if not mission or not wp_id:
+        return False
+    lane = wp_lane(repo, mission, wp_id)
+    if action == "implement":
+        return lane == "for_review"
+    if action == "review":
+        return lane in {"approved", "done"}
+    return True
 
 
 def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[str, Any]:
@@ -243,28 +284,43 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
                     "action_result": action_result,
                     "github_before": github_before,
                 }
-        worker_command = codex_prompt_command(repo, prompt_text, config)
+        worker_command = codex_prompt_command(repo, unattended_worker_prompt(prompt_text), config)
         worker_result = run_command(worker_command, repo)
-        pending = record_worker_pending(repo, plan, worker_result)
+        worker_completed = kitty_agent_worker_success(repo, mission, wp_id, action, worker_result)
+        effective_worker_result = dict(worker_result)
+        exited_zero_without_transition = not worker_completed and worker_result.get("returncode") == 0
+        if not worker_completed and worker_result.get("returncode") == 0:
+            effective_worker_result["returncode"] = 1
+            effective_worker_result["stderr_tail"] = (
+                effective_worker_result.get("stderr_tail", "")
+                + "\nWorker exited 0 but did not complete the Spec Kitty WP status transition."
+            )
+        pending = (
+            record_worker_pending(repo, plan, effective_worker_result)
+            if worker_completed or (effective_worker_result.get("returncode") != 0 and not exited_zero_without_transition)
+            else {"status": "not-recorded", "reason": "worker did not complete WP"}
+        )
         if mission and wp_id:
             github_after = sync_wp_status(
                 repo,
                 mission,
                 wp_id,
-                PHASE_REVIEWING if action == "implement" and worker_result.get("returncode") == 0 else wp_phase_for_action(action),
-                detail=f"Spec Kitty {action or 'agent'} worker completed with returncode {worker_result.get('returncode')}.",
+                PHASE_REVIEWING if action == "implement" and worker_completed else wp_phase_for_action(action),
+                detail=f"Spec Kitty {action or 'agent'} worker completed with returncode {effective_worker_result.get('returncode')}.",
                 execute=True,
             )
-            github_pr = open_or_update_mission_pr(repo, mission, execute=True)
+            if worker_completed:
+                github_pr = open_or_update_mission_pr(repo, mission, execute=True)
         return {
-            "status": "worker-finished",
+            "status": "worker-finished" if worker_completed else "worker-incomplete",
             "execution_kind": execution_kind,
             "action_result": action_result,
-            "worker_result": worker_result,
+            "worker_result": effective_worker_result,
             "pending_result": pending,
             "github_before": github_before,
             "github_after": github_after,
             "github_pr": github_pr,
+            "worker_completed": worker_completed,
         }
     decision_payload = plan.get("decision", {}).get("payload", {})
     prompt_file = decision_payload.get("prompt_file")
