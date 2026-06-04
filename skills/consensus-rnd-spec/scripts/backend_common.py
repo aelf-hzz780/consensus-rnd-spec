@@ -16,6 +16,7 @@ from typing import Any
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 VALID_BACKENDS = {"auto", "spec-kitty", "native"}
+VALID_KITTY_FLOW_ENFORCEMENT = {"strict", "off"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class HostConfig:
     spec_kitty_full_loop_enable: bool
     spec_kitty_mission: str
     spec_kitty_scan_limit: int
+    kitty_flow_enforcement: str
     native_full_loop_enable: bool
     native_consensus_skill_root: str
     synthetic_human_intake_enable: bool
@@ -85,6 +87,9 @@ def load_config(repo: Path) -> HostConfig:
         spec_kitty_scan_limit = max(1, int(env.get("SPEC_KITTY_SCAN_LIMIT", "30")))
     except ValueError:
         spec_kitty_scan_limit = 30
+    kitty_flow_enforcement = env.get("KITTY_FLOW_ENFORCEMENT", "strict").strip().lower()
+    if kitty_flow_enforcement not in VALID_KITTY_FLOW_ENFORCEMENT:
+        kitty_flow_enforcement = "strict"
     repo_root = Path(env.get("REPO_ROOT") or str(repo)).expanduser().resolve()
     return HostConfig(
         repo_root=repo_root,
@@ -96,6 +101,7 @@ def load_config(repo: Path) -> HostConfig:
         spec_kitty_full_loop_enable=parse_bool(env.get("SPEC_KITTY_FULL_LOOP_ENABLE"), default=True),
         spec_kitty_mission=env.get("SPEC_KITTY_MISSION", ""),
         spec_kitty_scan_limit=spec_kitty_scan_limit,
+        kitty_flow_enforcement=kitty_flow_enforcement,
         native_full_loop_enable=parse_bool(env.get("NATIVE_FULL_LOOP_ENABLE"), default=False),
         native_consensus_skill_root=env.get("NATIVE_CONSENSUS_SKILL_ROOT", ""),
         synthetic_human_intake_enable=parse_bool(env.get("SYNTHETIC_HUMAN_INTAKE_ENABLE"), default=True),

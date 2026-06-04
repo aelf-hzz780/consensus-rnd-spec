@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
@@ -18,6 +19,7 @@ sys.modules["backend_common"] = backend_common
 SPEC = importlib.util.spec_from_file_location("spec_backend", SCRIPT_DIR / "spec_backend.py")
 spec_backend = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
+sys.modules["spec_backend"] = spec_backend
 SPEC.loader.exec_module(spec_backend)
 
 
@@ -93,6 +95,118 @@ class SpecBackendTests(unittest.TestCase):
 
         self.assertEqual(summary["done"], 1)
         self.assertEqual(spec_backend.local_actionable_score(summary), 0)
+
+    def test_choose_mission_keeps_pre_wp_mission_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo"}\n', encoding="utf-8")
+            state = {
+                "command": ["spec-kitty", "orchestrator-api", "mission-state", "--mission", "001-demo"],
+                "returncode": 0,
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "summary": {
+                            "planned": 0,
+                            "claimed": 0,
+                            "in_progress": 0,
+                            "for_review": 0,
+                            "in_review": 0,
+                            "approved": 0,
+                            "done": 0,
+                            "blocked": 0,
+                            "canceled": 0,
+                        },
+                        "work_packages": [],
+                    },
+                },
+                "stderr": "",
+            }
+            with mock.patch.object(spec_backend, "mission_state", return_value=state):
+                chosen = spec_backend.choose_mission(repo)
+
+        self.assertEqual(chosen["mission"], "001-demo")
+        self.assertEqual(chosen["source"], "scan-pre-wp")
+
+    def test_plan_next_starts_preview_step_for_new_mission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport SPEC_KITTY_AGENT="codex"\n',
+                encoding="utf-8",
+            )
+            chosen = {"mission": "001-demo", "source": "scan-pre-wp"}
+            decision = {
+                "command": ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json"],
+                "returncode": 0,
+                "payload": {
+                    "kind": "query",
+                    "mission_slug": "001-demo",
+                    "action": None,
+                    "is_query": True,
+                    "preview_step": "discovery",
+                },
+                "stderr": "",
+            }
+            with mock.patch.object(spec_backend, "choose_mission", return_value=chosen), mock.patch.object(
+                spec_backend, "next_decision", return_value=decision
+            ):
+                plan = spec_backend.plan_next(repo)
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["execution_kind"], "kitty-next-step")
+        self.assertEqual(plan["advance_command"], ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"])
+
+    def test_plan_next_prefers_pending_worker_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec" / "state").mkdir(parents=True)
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport SPEC_KITTY_AGENT="codex"\n',
+                encoding="utf-8",
+            )
+            spec_backend.write_pending_result(
+                repo,
+                {
+                    "mission_slug": "001-demo",
+                    "result": "success",
+                    "completed_action": "research",
+                },
+            )
+
+            plan = spec_backend.plan_next(repo)
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["execution_kind"], "kitty-next-step")
+        self.assertEqual(plan["reason"], "advance_after_worker_result")
+        self.assertEqual(plan["advance_command"], ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"])
+
+    def test_wp_action_from_chosen_uses_kitty_agent_action(self) -> None:
+        chosen = {
+            "mission": "001-demo",
+            "state": {
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "work_packages": [
+                            {"wp_id": "WP01", "lane": "done"},
+                            {"wp_id": "WP02", "lane": "for_review"},
+                        ]
+                    },
+                }
+            },
+        }
+
+        plan = spec_backend.wp_action_from_chosen(chosen, "001-demo", "codex")
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["execution_kind"], "kitty-agent-action")
+        self.assertEqual(plan["action"], "review")
+        self.assertEqual(plan["action_command"], ["spec-kitty", "agent", "action", "review", "WP02", "--mission", "001-demo", "--agent", "codex"])
 
 
 if __name__ == "__main__":

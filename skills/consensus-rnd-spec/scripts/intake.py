@@ -114,6 +114,10 @@ def execute_intake_seed(repo: Path, plan: dict[str, Any]) -> dict[str, Any] | No
         title=str(seed["title"]),
         body=str(seed["body"]),
         source=str(seed.get("source") or "synthetic_human_intake"),
+        source_kind=str(seed.get("source_kind") or seed.get("source") or "synthetic_human_intake"),
+        source_issue=str(seed.get("source_issue") or ""),
+        source_pr=str(seed.get("source_pr") or ""),
+        source_url=str(seed.get("source_url") or ""),
     )
 
 
@@ -130,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="Host repository root")
     parser.add_argument("--text", help="Slash-style intake text")
     parser.add_argument("--prompt-file", help="Read slash-style intake text from a file")
+    parser.add_argument("--source-kind", default="", help="Optional source kind for issue/PR/native intake artifacts")
+    parser.add_argument("--source-issue", default="", help="Optional source GitHub issue number")
+    parser.add_argument("--source-pr", default="", help="Optional source GitHub PR number")
+    parser.add_argument("--source-url", default="", help="Optional source URL")
     parser.add_argument("--run", action="store_true", help="Run the controller after intake planning")
     parser.add_argument("--once", action="store_true", help="Run only one controller turn")
     parser.add_argument("--execute", action="store_true", help="Write seed artifacts and allow backend execution")
@@ -138,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(args.repo).resolve()
     text = read_text_arg(args)
     plan = plan_intake(repo, text)
+    if isinstance(plan.get("seed"), dict):
+        plan["seed"].update(
+            {
+                "source_kind": args.source_kind or plan["seed"].get("source"),
+                "source_issue": args.source_issue,
+                "source_pr": args.source_pr,
+                "source_url": args.source_url,
+            }
+        )
     if args.execute:
         seed = execute_intake_seed(repo, plan)
         if seed is not None:

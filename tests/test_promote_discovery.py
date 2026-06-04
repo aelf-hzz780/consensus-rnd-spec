@@ -105,6 +105,48 @@ class PromoteDiscoveryTests(unittest.TestCase):
         self.assertTrue(intake_exists)
         self.assertEqual(meta["consensus_rnd_spec"]["evidence_hash"], "abc123")
 
+    def test_execute_writes_issue_pr_source_metadata_to_mission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            runs = repo / ".consensus-rnd-spec" / "runs"
+            runs.mkdir(parents=True)
+            artifact = runs / "discovery-20260101T000000Z-pr.json"
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "evidence_hash": "pr123",
+                        "finding_count": 0,
+                        "findings": [],
+                        "source_kind": "github_pr",
+                        "source_pr": "123",
+                        "source_url": "https://github.com/example/repo/pull/123",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mission_dir = repo / "kitty-specs" / "demo-pr-mission"
+            mission_dir.mkdir(parents=True)
+            (mission_dir / "meta.json").write_text('{"mission_slug":"demo-pr-mission"}\n', encoding="utf-8")
+            with mock.patch.object(
+                promote_discovery,
+                "run_specify",
+                return_value={
+                    "command": ["spec-kitty"],
+                    "returncode": 0,
+                    "payload": {"mission_slug": "demo-pr-mission", "feature_dir": str(mission_dir)},
+                    "stderr": "",
+                },
+            ), mock.patch.dict(os.environ, {}, clear=True):
+                result = promote_discovery.promote(repo, execute=True)
+
+            intake_json = json.loads((mission_dir / "consensus-rnd" / "intake.json").read_text(encoding="utf-8"))
+            meta = json.loads((mission_dir / "meta.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "promoted")
+        self.assertEqual(intake_json["source_kind"], "github_pr")
+        self.assertEqual(intake_json["source_pr"], "123")
+        self.assertEqual(meta["consensus_rnd_spec"]["source_url"], "https://github.com/example/repo/pull/123")
+
 
 if __name__ == "__main__":
     unittest.main()

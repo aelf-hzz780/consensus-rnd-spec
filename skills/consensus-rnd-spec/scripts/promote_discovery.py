@@ -72,6 +72,10 @@ def body_from_discovery(payload: dict[str, Any], artifact: Path) -> str:
         "# Consensus R&D discovery intake",
         "",
         f"- Source: consensus-rnd-spec",
+        f"- Source kind: {payload.get('source_kind') or payload.get('source') or 'unknown'}",
+        f"- Source issue: {payload.get('source_issue') or 'n/a'}",
+        f"- Source PR: {payload.get('source_pr') or 'n/a'}",
+        f"- Source URL: {payload.get('source_url') or 'n/a'}",
         f"- Artifact: {artifact}",
         f"- Evidence hash: {payload.get('evidence_hash') or evidence_hash(json.dumps(payload, sort_keys=True))}",
         f"- Finding count: {payload.get('finding_count', 0)}",
@@ -155,6 +159,10 @@ def write_mission_intake(mission_dir: Path, seed: dict[str, Any], source_payload
     metadata_path = consensus_dir / "intake.json"
     metadata = {
         "source": "consensus-rnd-spec",
+        "source_kind": source_payload.get("source_kind") or source_payload.get("source"),
+        "source_issue": source_payload.get("source_issue") or "",
+        "source_pr": source_payload.get("source_pr") or "",
+        "source_url": source_payload.get("source_url") or "",
         "artifact": seed.get("artifact"),
         "evidence_hash": seed.get("evidence_hash"),
         "mission_type": seed.get("mission_type"),
@@ -174,6 +182,10 @@ def write_mission_intake(mission_dir: Path, seed: dict[str, Any], source_payload
         if isinstance(meta, dict):
             meta["consensus_rnd_spec"] = {
                 "source": "consensus-rnd-spec",
+                "source_kind": source_payload.get("source_kind") or source_payload.get("source"),
+                "source_issue": source_payload.get("source_issue") or "",
+                "source_pr": source_payload.get("source_pr") or "",
+                "source_url": source_payload.get("source_url") or "",
                 "artifact": seed.get("artifact"),
                 "evidence_hash": seed.get("evidence_hash"),
                 "intake": str(intake_path),

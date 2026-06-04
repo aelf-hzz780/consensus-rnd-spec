@@ -87,6 +87,32 @@ class IntakeTests(unittest.TestCase):
         self.assertTrue(payload["synthetic_human_intake"])
         self.assertIn("Human: inspect stale work", payload["body"])
 
+    def test_execute_preserves_github_issue_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs").mkdir()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                intake,
+                "detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ):
+                plan = intake.plan_intake(repo, "/loop 1min /consensus-rnd-spec fix issue 123")
+                assert isinstance(plan["seed"], dict)
+                plan["seed"].update(
+                    {
+                        "source_kind": "github_issue",
+                        "source_issue": "123",
+                        "source_url": "https://github.com/example/repo/issues/123",
+                    }
+                )
+                seed = intake.execute_intake_seed(repo, plan)
+                assert seed is not None
+                payload = json.loads(Path(seed["artifact"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["source_kind"], "github_issue")
+        self.assertEqual(payload["source_issue"], "123")
+        self.assertEqual(payload["source_url"], "https://github.com/example/repo/issues/123")
+
 
 if __name__ == "__main__":
     unittest.main()

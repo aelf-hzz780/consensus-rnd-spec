@@ -6,11 +6,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 
-CONTRACT_VERSION = "native-capabilities.v1"
+CONTRACT_VERSION = "native-capabilities.v2"
+LATEST_CONTROLLER_COMMANDS = (
+    "spawn-codex",
+    "peek",
+    "wakeup-plan",
+    "wakeup-runner",
+    "check-degradation",
+    "daemon-status",
+    "pr-checks",
+    "release-gate",
+)
 
 
 def _entrypoint(path: Path, *, executable_required: bool) -> dict[str, Any]:
@@ -22,6 +33,32 @@ def _entrypoint(path: Path, *, executable_required: bool) -> dict[str, Any]:
         "exists": exists,
         "executable": executable,
         "usable": usable,
+    }
+
+
+def _cli_commands(cli_path: Path) -> dict[str, Any]:
+    if not cli_path.is_file():
+        return {"available": False, "commands": [], "supports_latest_controller": False, "missing_latest_controller": list(LATEST_CONTROLLER_COMMANDS)}
+    text = cli_path.read_text(encoding="utf-8", errors="ignore")
+    commands = sorted(set(re.findall(r'"([a-z][a-z0-9-]+)"\s*:\s*CommandSpec', text)))
+    missing = [command for command in LATEST_CONTROLLER_COMMANDS if command not in commands]
+    return {
+        "available": bool(commands),
+        "commands": commands,
+        "supports_latest_controller": not missing,
+        "missing_latest_controller": missing,
+    }
+
+
+def _script_contract(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"available": False}
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "available": True,
+        "has_unattended_bypass": "--dangerously-bypass-approvals-and-sandbox" in text,
+        "has_file_prompt_contract": "--prompt" in text and "SPAWN: prompt=" in text,
+        "has_stall_supervision": "STALL_KILL_AFTER" in text or "--stall" in text,
     }
 
 
@@ -42,9 +79,19 @@ def detect_native_capabilities(skill_root: str | Path) -> dict[str, Any]:
     scripts = root / "scripts"
     legacy_cli = _entrypoint(scripts / "consensus-rnd-cli", executable_required=True)
     spawn_wrapper = _entrypoint(scripts / "spawn-codex.sh", executable_required=False)
+    python_cli = root / "scripts" / "codex_refactor_loop" / "cli.py"
+    wakeup_runner = root / "scripts" / "codex_refactor_loop" / "wakeup_runner.py"
     payload["entrypoints"] = {
         "legacy_cli": legacy_cli,
         "spawn_wrapper": spawn_wrapper,
+    }
+    payload["controller_surface"] = {
+        "cli": _cli_commands(python_cli),
+        "spawn_wrapper_contract": _script_contract(scripts / "spawn-codex.sh"),
+        "wakeup_runner": {
+            "path": str(wakeup_runner),
+            "exists": wakeup_runner.is_file(),
+        },
     }
 
     if legacy_cli["usable"]:
@@ -53,6 +100,7 @@ def detect_native_capabilities(skill_root: str | Path) -> dict[str, Any]:
                 "status": "ready",
                 "entrypoint": "legacy-cli",
                 "next": "delegate to codex-refactor-loop via consensus-rnd-cli spawn-codex",
+                "supports_latest_controller": payload["controller_surface"]["cli"]["supports_latest_controller"],
             }
         )
         return payload
@@ -63,6 +111,7 @@ def detect_native_capabilities(skill_root: str | Path) -> dict[str, Any]:
                 "status": "ready",
                 "entrypoint": "spawn-wrapper",
                 "next": "delegate to codex-refactor-loop via spawn-codex.sh",
+                "supports_latest_controller": False,
             }
         )
         return payload
