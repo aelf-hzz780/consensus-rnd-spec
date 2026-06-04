@@ -55,6 +55,24 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(plan["seed"]["source"], "synthetic_human_intake")
         self.assertEqual(plan["seed"]["handoff"], "spec-kitty")
 
+    def test_plan_intake_expands_markdown_prompt_file_for_cockpit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs").mkdir()
+            prompt = repo / "AutoTwitter驾驶舱.md"
+            prompt.write_text("# 多策略多账号 Twitter 驾驶舱方案\n\n新增 Cockpit 系统。\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                intake,
+                "detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ):
+                plan = intake.plan_intake(repo, f"/loop 10min /codex-refactor-loop {prompt}")
+
+        self.assertEqual(plan["seed"]["title"], "cockpit-readonly-dashboard")
+        self.assertIn("# 多策略多账号 Twitter 驾驶舱方案", plan["seed"]["body"])
+        self.assertEqual(plan["seed"]["metadata"]["prompt_file"]["path"], str(prompt.resolve()))
+        self.assertEqual(plan["seed"]["metadata"]["branch_contract"]["primary"], "feature/cockpit")
+
     def test_plan_intake_creates_artifact_only_seed_for_native_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -112,6 +130,44 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(payload["source_kind"], "github_issue")
         self.assertEqual(payload["source_issue"], "123")
         self.assertEqual(payload["source_url"], "https://github.com/example/repo/issues/123")
+
+    def test_main_execute_run_promotes_explicit_seed_before_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs").mkdir()
+            prompt = repo / "AutoTwitter驾驶舱.md"
+            prompt.write_text("# Cockpit plan\n", encoding="utf-8")
+            promoted: list[Path] = []
+
+            def fake_promote(_repo: Path, *, artifact: Path | None = None, execute: bool = False):
+                assert artifact is not None
+                promoted.append(artifact)
+                return {"status": "promoted", "artifact": str(artifact), "execute": execute}
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                intake,
+                "detect_backend",
+                return_value={"backend": "spec-kitty", "reason": "test", "repo_root": str(repo), "signals": {}},
+            ), mock.patch.object(intake, "promote_discovery", side_effect=fake_promote), mock.patch.object(
+                intake,
+                "run_loop",
+                return_value={"turns": [], "turn_count": 0, "execute": True},
+            ), mock.patch.object(intake, "print_json"):
+                rc = intake.main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--text",
+                        f"/loop 10min /codex-refactor-loop {prompt}",
+                        "--execute",
+                        "--run",
+                        "--once",
+                    ]
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(promoted), 1)
+        self.assertTrue(promoted[0].name.startswith("discovery-"))
 
 
 if __name__ == "__main__":

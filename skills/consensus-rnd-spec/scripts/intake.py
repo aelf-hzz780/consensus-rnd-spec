@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from backend_common import detect_backend, load_config, parse_duration_seconds, print_json
+from promote_discovery import promote as promote_discovery
 from run_loop import run_loop
 from spec_backend import evidence_hash, write_discovery_seed
 
@@ -24,6 +25,30 @@ def normalize_text(text: str) -> str:
 
 def collapse_ws(text: str) -> str:
     return " ".join(text.split())
+
+
+def extract_markdown_file(instructions: str) -> Path | None:
+    for token in instructions.split():
+        candidate = Path(token).expanduser()
+        if candidate.suffix.lower() == ".md" and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def current_branch(repo: Path) -> str:
+    import subprocess
+
+    result = subprocess.run(["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True, check=False)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def seed_title(parsed: dict[str, Any]) -> str:
+    prompt_file = parsed.get("prompt_file")
+    if isinstance(prompt_file, dict):
+        title = str(prompt_file.get("title") or "")
+        if "驾驶舱" in title or "cockpit" in title.lower():
+            return "cockpit-readonly-dashboard"
+    return title_from_intake(parsed)
 
 
 def parse_intake(text: str) -> dict[str, Any]:
@@ -46,6 +71,11 @@ def parse_intake(text: str) -> dict[str, Any]:
 
 
 def title_from_intake(parsed: dict[str, Any]) -> str:
+    prompt_file = parsed.get("prompt_file")
+    if isinstance(prompt_file, dict):
+        title = prompt_file.get("title")
+        if isinstance(title, str) and title.strip():
+            return f"consensus intake: {title.strip()}"[:96]
     instructions = str(parsed.get("instructions") or "").strip()
     if not instructions:
         return "consensus loop intake"
@@ -56,6 +86,19 @@ def title_from_intake(parsed: dict[str, Any]) -> str:
 
 
 def body_from_intake(parsed: dict[str, Any], backend: dict[str, Any]) -> str:
+    prompt_file = parsed.get("prompt_file")
+    prompt_section: list[str] = []
+    if isinstance(prompt_file, dict):
+        prompt_section = [
+            "",
+            "## Referenced Plan",
+            "",
+            f"- Path: {prompt_file.get('path')}",
+            f"- SHA256: {prompt_file.get('sha256')}",
+            "",
+            str(prompt_file.get("content") or "").strip(),
+            "",
+        ]
     lines = [
         "# Consensus R&D slash intake",
         "",
@@ -68,6 +111,12 @@ def body_from_intake(parsed: dict[str, Any], backend: dict[str, Any]) -> str:
         "## Synthetic intake",
         "",
         str(parsed.get("synthetic_human") or "Human: continue the unattended Consensus R&D loop."),
+        *prompt_section,
+        "## Branch Contract",
+        "",
+        "- Primary landing branch: `feature/cockpit`.",
+        "- If additional branches are needed, they must match `xxx/cockpit-xxxx`.",
+        "- Do not create unrelated `codex/socialops-*` or generic mission branches for this intake.",
         "",
         "## Guardrails",
         "",
@@ -81,6 +130,15 @@ def body_from_intake(parsed: dict[str, Any], backend: dict[str, Any]) -> str:
 def plan_intake(repo: Path, text: str) -> dict[str, Any]:
     config = load_config(repo)
     parsed = parse_intake(text)
+    prompt_file = extract_markdown_file(str(parsed.get("instructions") or ""))
+    if prompt_file is not None:
+        content = prompt_file.read_text(encoding="utf-8")
+        parsed["prompt_file"] = {
+            "path": str(prompt_file),
+            "title": prompt_file.stem,
+            "sha256": evidence_hash(content),
+            "content": content,
+        }
     backend = detect_backend(config.repo_root, mode=config.backend_mode)
     duration_seconds = parse_duration_seconds(parsed["duration"], config.loop_interval_seconds)
     plan: dict[str, Any] = {
@@ -91,13 +149,22 @@ def plan_intake(repo: Path, text: str) -> dict[str, Any]:
         "seed": None,
     }
     if parsed["synthetic_human"] and config.synthetic_human_intake_enable:
-        title = title_from_intake(parsed)
+        title = seed_title(parsed)
         body = body_from_intake(parsed, backend)
         plan["seed"] = {
             "status": "planned",
             "title": title,
             "body": body,
             "source": "synthetic_human_intake",
+            "metadata": {
+                "slash_surface": parsed.get("surfaces") or [],
+                "prompt_file": parsed.get("prompt_file"),
+                "branch_contract": {
+                    "primary": "feature/cockpit",
+                    "additional_pattern": "xxx/cockpit-xxxx",
+                    "current_branch": current_branch(config.repo_root),
+                },
+            },
             "mission_type": config.spec_kitty_mission_type,
             "evidence_hash": evidence_hash(title + "\n" + body),
             "handoff": "spec-kitty" if backend.get("backend") == "spec-kitty" else "artifact-only",
@@ -118,6 +185,7 @@ def execute_intake_seed(repo: Path, plan: dict[str, Any]) -> dict[str, Any] | No
         source_issue=str(seed.get("source_issue") or ""),
         source_pr=str(seed.get("source_pr") or ""),
         source_url=str(seed.get("source_url") or ""),
+        metadata=seed.get("metadata") if isinstance(seed.get("metadata"), dict) else None,
     )
 
 
@@ -159,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         seed = execute_intake_seed(repo, plan)
         if seed is not None:
             plan["seed"] = seed
+            if plan.get("backend", {}).get("backend") == "spec-kitty":
+                artifact = seed.get("artifact")
+                if isinstance(artifact, str) and artifact:
+                    plan["promotion"] = promote_discovery(repo, artifact=Path(artifact), execute=True)
     if args.run:
         plan["loop"] = run_loop(repo, int(plan["duration_seconds"]), execute=args.execute, once=args.once)
     print_json(plan)

@@ -462,6 +462,7 @@ def write_discovery_seed(
     source_issue: str = "",
     source_pr: str = "",
     source_url: str = "",
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = load_config(repo)
     runs = config.repo_root / ".consensus-rnd-spec" / "runs"
@@ -483,6 +484,8 @@ def write_discovery_seed(
         "evidence_hash": evidence_hash(title + "\n" + body),
         "created_at": stamp,
     }
+    if metadata:
+        payload["metadata"] = metadata
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"artifact": str(path), "payload": payload}
 
