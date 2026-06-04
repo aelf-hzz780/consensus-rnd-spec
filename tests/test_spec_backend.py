@@ -214,6 +214,52 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["action"], "review")
         self.assertEqual(plan["action_command"], ["spec-kitty", "agent", "action", "review", "WP02", "--mission", "001-demo", "--agent", "codex"])
 
+    def test_wp_action_from_chosen_resumes_in_progress_before_planned_dependency(self) -> None:
+        chosen = {
+            "mission": "001-demo",
+            "state": {
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "work_packages": [
+                            {"wp_id": "WP01", "lane": "in_progress", "dependencies": []},
+                            {"wp_id": "WP02", "lane": "planned", "dependencies": ["WP01"]},
+                        ]
+                    },
+                }
+            },
+        }
+
+        plan = spec_backend.wp_action_from_chosen(chosen, "001-demo", "codex")
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["action"], "implement")
+        self.assertEqual(plan["wp_id"], "WP01")
+
+    def test_wp_action_from_chosen_skips_planned_wp_with_unmet_dependencies(self) -> None:
+        chosen = {
+            "mission": "001-demo",
+            "state": {
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "work_packages": [
+                            {"wp_id": "WP01", "lane": "in_progress", "dependencies": []},
+                            {"wp_id": "WP02", "lane": "planned", "dependencies": ["WP01"]},
+                        ]
+                    },
+                }
+            },
+        }
+
+        packages = spec_backend.state_work_packages(chosen["state"])
+        lanes = spec_backend.state_lane_items(chosen["state"])
+        packages = [package for package in packages if package["lane"] == "planned"]
+        target = spec_backend.first_actionable_wp(packages, lanes)
+
+        self.assertIsNone(target)
+
     def test_plan_next_adds_github_child_issue_plan_for_wp_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

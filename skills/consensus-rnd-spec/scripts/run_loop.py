@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -63,8 +65,37 @@ def codex_prompt_command(repo: Path, prompt_text: str, config) -> list[str]:
     return command
 
 
+def spec_kitty_site_packages() -> str:
+    executable = shutil.which("spec-kitty")
+    if not executable:
+        return ""
+    try:
+        first_line = Path(executable).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+    except (OSError, IndexError):
+        return ""
+    if not first_line.startswith("#!"):
+        return ""
+    interpreter = Path(first_line[2:].strip().split()[0])
+    root = interpreter.parent.parent
+    for candidate in sorted((root / "lib").glob("python*/site-packages")):
+        if (candidate / "specify_cli").is_dir():
+            return str(candidate)
+    return ""
+
+
+def command_env() -> dict[str, str]:
+    env = dict(os.environ)
+    site_packages = spec_kitty_site_packages()
+    if site_packages:
+        current = env.get("PYTHONPATH", "")
+        parts = [part for part in current.split(os.pathsep) if part]
+        if site_packages not in parts:
+            env["PYTHONPATH"] = os.pathsep.join([site_packages, *parts])
+    return env
+
+
 def run_command(command: list[str], repo: Path) -> dict[str, Any]:
-    result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+    result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False, env=command_env())
     return {
         "command": command,
         "returncode": result.returncode,
@@ -162,6 +193,16 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
     action_command = plan.get("action_command")
     if not action_command:
         return {"status": "noop", "reason": "no actionable Spec Kitty command"}
+    if plan.get("execution_kind") == "kitty-agent-action":
+        mission = plan_mission(plan)
+        if mission:
+            github_children = ensure_child_issues(repo, mission, execute=True)
+            if github_children.get("status") not in {"ready", "created", "disabled"}:
+                return {
+                    "status": "blocked",
+                    "reason": "GitHub child issue sync failed before Spec Kitty action",
+                    "github_children": github_children,
+                }
     action_result = run_command(action_command, repo)
     if execution_kind == "kitty-agent-action":
         mission = plan_mission(plan)

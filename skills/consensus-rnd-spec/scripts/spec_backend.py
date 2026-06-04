@@ -204,22 +204,38 @@ def mission_pre_wp_candidate(state: dict[str, Any]) -> bool:
     return True
 
 
-def state_lane_items(state: dict[str, Any]) -> dict[str, str]:
+def state_work_packages(state: dict[str, Any]) -> list[dict[str, Any]]:
     payload = state.get("payload", {})
     data = payload.get("data", {})
     if not isinstance(data, dict):
-        return {}
+        return []
     packages = data.get("work_packages")
     if not isinstance(packages, list):
-        return {}
-    items: dict[str, str] = {}
+        return []
+    items: list[dict[str, Any]] = []
     for package in packages:
         if not isinstance(package, dict):
             continue
         wp_id = package.get("wp_id") or package.get("id") or package.get("work_package_id")
         lane = package.get("lane") or package.get("status") or package.get("state")
         if isinstance(wp_id, str) and wp_id and isinstance(lane, str) and lane:
-            items[wp_id] = lane
+            dependencies = package.get("dependencies")
+            if not isinstance(dependencies, list):
+                dependencies = []
+            items.append(
+                {
+                    "wp_id": wp_id,
+                    "lane": lane,
+                    "dependencies": [str(dep) for dep in dependencies if isinstance(dep, str) and dep],
+                }
+            )
+    return items
+
+
+def state_lane_items(state: dict[str, Any]) -> dict[str, str]:
+    items: dict[str, str] = {}
+    for package in state_work_packages(state):
+        items[str(package["wp_id"])] = str(package["lane"])
     return items
 
 
@@ -318,24 +334,40 @@ def clear_pending_result(repo: Path) -> None:
     pending_result_path(repo).unlink(missing_ok=True)
 
 
-def first_actionable_wp(items: dict[str, str]) -> tuple[str, str] | None:
-    for lane, action in (("for_review", "review"), ("planned", "implement")):
-        for wp_id in sorted(items):
-            if items[wp_id] == lane:
-                return action, wp_id
+def dependencies_satisfied(package: dict[str, Any], lanes: dict[str, str]) -> bool:
+    for dependency in package.get("dependencies", []):
+        if lanes.get(str(dependency)) != "done":
+            return False
+    return True
+
+
+def first_actionable_wp(packages: list[dict[str, Any]], lanes: dict[str, str]) -> tuple[str, str] | None:
+    for package in sorted(packages, key=lambda item: str(item["wp_id"])):
+        if package["lane"] == "for_review":
+            return "review", str(package["wp_id"])
+    for package in sorted(packages, key=lambda item: str(item["wp_id"])):
+        if package["lane"] == "in_progress":
+            return "implement", str(package["wp_id"])
+    for package in sorted(packages, key=lambda item: str(item["wp_id"])):
+        if package["lane"] == "planned" and dependencies_satisfied(package, lanes):
+            return "implement", str(package["wp_id"])
     return None
 
 
 def wp_action_from_chosen(chosen: dict[str, Any], mission: str, agent: str) -> dict[str, Any] | None:
     state = chosen.get("state") if isinstance(chosen.get("state"), dict) else {}
-    items = state_lane_items(state)
-    if not items:
+    packages = state_work_packages(state)
+    if packages:
+        lanes = {str(package["wp_id"]): str(package["lane"]) for package in packages}
+    else:
+        lanes = {}
         local = chosen.get("local")
         if isinstance(local, dict):
             local_items = local.get("items")
             if isinstance(local_items, dict):
-                items = {str(key): str(value) for key, value in local_items.items()}
-    target = first_actionable_wp(items)
+                lanes = {str(key): str(value) for key, value in local_items.items()}
+                packages = [{"wp_id": wp_id, "lane": lane, "dependencies": []} for wp_id, lane in lanes.items()]
+    target = first_actionable_wp(packages, lanes)
     if target is None:
         return None
     action, wp_id = target

@@ -206,6 +206,8 @@ class RunLoopTests(unittest.TestCase):
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
             with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch(
                 "run_loop.sync_wp_status",
                 side_effect=[
                     {"status": "synced", "issue": "10", "phase": "crnd:phase:implementing"},
@@ -248,6 +250,8 @@ class RunLoopTests(unittest.TestCase):
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
             with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch(
                 "run_loop.sync_wp_status",
                 return_value={"status": "blocked", "reason": "failed to sync WP issue status"},
             ), mock.patch("run_loop.open_or_update_mission_pr") as pr_sync:
@@ -258,6 +262,29 @@ class RunLoopTests(unittest.TestCase):
         self.assertTrue(any(command[:4] == ["spec-kitty", "agent", "action", "implement"] for command in calls))
         self.assertFalse(any(command[:2] == ["codex", "exec"] for command in calls))
         pr_sync.assert_not_called()
+
+    def test_execute_kitty_agent_action_blocks_before_action_when_child_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.ensure_child_issues", return_value={"status": "blocked", "reason": "gh auth failed"}), mock.patch(
+                "run_loop.run_command"
+            ) as run, mock.patch("run_loop.sync_wp_status") as sync:
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "GitHub child issue sync failed before Spec Kitty action")
+        run.assert_not_called()
+        sync.assert_not_called()
 
     def test_execute_kitty_agent_action_does_not_sync_github_when_action_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,7 +305,9 @@ class RunLoopTests(unittest.TestCase):
                 raise AssertionError(command)
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
-            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch("run_loop.sync_wp_status") as sync:
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch("run_loop.sync_wp_status") as sync:
                 result = run_loop.execute_spec_kitty_action(repo, plan, config)
 
         self.assertEqual(result["status"], "action-command-only")
