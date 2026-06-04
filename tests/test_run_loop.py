@@ -193,7 +193,13 @@ class RunLoopTests(unittest.TestCase):
                 raise AssertionError(command)
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
-            with mock.patch("run_loop.run_command", side_effect=fake_run):
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.sync_wp_status",
+                side_effect=[
+                    {"status": "synced", "issue": "10", "phase": "crnd:phase:implementing"},
+                    {"status": "synced", "issue": "10", "phase": "crnd:phase:reviewing"},
+                ],
+            ) as sync, mock.patch("run_loop.open_or_update_mission_pr", return_value={"status": "ready", "mission_pr": {"number": "20"}}) as pr_sync:
                 result = run_loop.execute_spec_kitty_action(repo, plan, config)
 
             pending_path = repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json"
@@ -203,6 +209,43 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(result["execution_kind"], "kitty-agent-action")
         self.assertEqual(pending["mission_slug"], "001-demo")
         self.assertEqual(pending["completed_action"], "implement")
+        self.assertEqual(sync.call_count, 2)
+        pr_sync.assert_called_once_with(repo, "001-demo", execute=True)
+
+    def test_execute_kitty_agent_action_blocks_worker_when_github_presync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                calls.append(command)
+                if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "Implement WP01\n", "stderr_tail": ""}
+                if command[:2] == ["codex", "exec"]:
+                    raise AssertionError("worker should not be dispatched after GitHub sync failure")
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.sync_wp_status",
+                return_value={"status": "blocked", "reason": "failed to sync WP issue status"},
+            ), mock.patch("run_loop.open_or_update_mission_pr") as pr_sync:
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "GitHub status sync failed before worker dispatch")
+        self.assertTrue(any(command[:4] == ["spec-kitty", "agent", "action", "implement"] for command in calls))
+        self.assertFalse(any(command[:2] == ["codex", "exec"] for command in calls))
+        pr_sync.assert_not_called()
 
     def test_execute_kitty_agent_action_does_not_sync_github_when_action_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

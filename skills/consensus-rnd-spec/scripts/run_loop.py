@@ -190,6 +190,14 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
                 detail=f"Spec Kitty {action or 'agent'} action dispatched.",
                 execute=True,
             )
+            if github_before.get("status") not in {"synced", "disabled"}:
+                return {
+                    "status": "blocked",
+                    "reason": "GitHub status sync failed before worker dispatch",
+                    "execution_kind": execution_kind,
+                    "action_result": action_result,
+                    "github_before": github_before,
+                }
         worker_command = codex_prompt_command(repo, prompt_text, config)
         worker_result = run_command(worker_command, repo)
         pending = record_worker_pending(repo, plan, worker_result)
