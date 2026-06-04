@@ -11,7 +11,7 @@ from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
-for name in ("backend_common", "spec_backend"):
+for name in ("backend_common", "github_sync", "spec_backend"):
     spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -57,6 +57,10 @@ class PromoteDiscoveryTests(unittest.TestCase):
                 promote_discovery,
                 "run_specify",
                 return_value={"command": ["spec-kitty"], "returncode": 0, "payload": {"slug": "demo"}, "stderr": ""},
+            ), mock.patch.object(
+                promote_discovery,
+                "ensure_parent_issue",
+                return_value={"status": "ready", "parent_issue": {"number": "9"}},
             ), mock.patch.dict(os.environ, {}, clear=True):
                 result = promote_discovery.promote(repo, execute=True)
             log = repo / ".consensus-rnd-spec" / "state" / "promotions.jsonl"
@@ -94,6 +98,10 @@ class PromoteDiscoveryTests(unittest.TestCase):
                     "payload": {"mission_slug": "demo-mission", "feature_dir": str(mission_dir)},
                     "stderr": "",
                 },
+            ), mock.patch.object(
+                promote_discovery,
+                "ensure_parent_issue",
+                return_value={"status": "ready", "parent_issue": {"number": "9"}},
             ), mock.patch.dict(os.environ, {}, clear=True):
                 result = promote_discovery.promote(repo, execute=True)
 
@@ -136,6 +144,10 @@ class PromoteDiscoveryTests(unittest.TestCase):
                     "payload": {"mission_slug": "demo-pr-mission", "feature_dir": str(mission_dir)},
                     "stderr": "",
                 },
+            ), mock.patch.object(
+                promote_discovery,
+                "ensure_parent_issue",
+                return_value={"status": "ready", "parent_issue": {"number": "9"}},
             ), mock.patch.dict(os.environ, {}, clear=True):
                 result = promote_discovery.promote(repo, execute=True)
 

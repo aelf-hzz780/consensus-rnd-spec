@@ -26,6 +26,13 @@ from spec_backend import clear_pending_result, plan_next, write_pending_result
 from discovery import produce as produce_discovery
 from promote_discovery import promote as promote_discovery
 from native_capabilities import detect_native_capabilities
+from github_sync import (
+    PHASE_IMPLEMENTING,
+    PHASE_REVIEWING,
+    ensure_child_issues,
+    open_or_update_mission_pr,
+    sync_wp_status,
+)
 
 
 def skill_root() -> Path:
@@ -88,6 +95,22 @@ def record_worker_pending(repo: Path, plan: dict[str, Any], worker_result: dict[
     return {"status": "recorded", "path": str(path), "payload": payload}
 
 
+def plan_mission(plan: dict[str, Any]) -> str:
+    decision_payload = plan.get("decision", {}).get("payload", {})
+    return str(
+        decision_payload.get("mission_slug")
+        or plan.get("chosen", {}).get("mission")
+        or plan.get("pending_result", {}).get("mission_slug")
+        or ""
+    )
+
+
+def wp_phase_for_action(action: str | None) -> str:
+    if action == "review":
+        return PHASE_REVIEWING
+    return PHASE_IMPLEMENTING
+
+
 def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[str, Any]:
     if plan.get("status") == "discovery_needed":
         promotion = promote_discovery(repo, execute=False)
@@ -137,20 +160,58 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
         return {"status": "noop", "reason": "no actionable Spec Kitty command"}
     action_result = run_command(action_command, repo)
     if execution_kind == "kitty-agent-action":
+        mission = plan_mission(plan)
+        wp_id = str(plan.get("wp_id") or plan.get("decision", {}).get("payload", {}).get("wp_id") or "")
+        action = str(plan.get("action") or plan.get("decision", {}).get("payload", {}).get("action") or "")
+        github_before = None
+        github_after = None
+        github_pr = None
         if action_result["returncode"] != 0:
-            return {"status": "action-command-only", "execution_kind": execution_kind, "action_result": action_result}
+            return {
+                "status": "action-command-only",
+                "execution_kind": execution_kind,
+                "action_result": action_result,
+                "github_before": None,
+            }
         prompt_text = action_result.get("stdout_tail") or ""
         if not prompt_text.strip():
-            return {"status": "action-command-only", "execution_kind": execution_kind, "action_result": action_result}
+            return {
+                "status": "action-command-only",
+                "execution_kind": execution_kind,
+                "action_result": action_result,
+                "github_before": None,
+            }
+        if mission and wp_id:
+            github_before = sync_wp_status(
+                repo,
+                mission,
+                wp_id,
+                wp_phase_for_action(action),
+                detail=f"Spec Kitty {action or 'agent'} action dispatched.",
+                execute=True,
+            )
         worker_command = codex_prompt_command(repo, prompt_text, config)
         worker_result = run_command(worker_command, repo)
         pending = record_worker_pending(repo, plan, worker_result)
+        if mission and wp_id:
+            github_after = sync_wp_status(
+                repo,
+                mission,
+                wp_id,
+                PHASE_REVIEWING if action == "implement" and worker_result.get("returncode") == 0 else wp_phase_for_action(action),
+                detail=f"Spec Kitty {action or 'agent'} worker completed with returncode {worker_result.get('returncode')}.",
+                execute=True,
+            )
+            github_pr = open_or_update_mission_pr(repo, mission, execute=True)
         return {
             "status": "worker-finished",
             "execution_kind": execution_kind,
             "action_result": action_result,
             "worker_result": worker_result,
             "pending_result": pending,
+            "github_before": github_before,
+            "github_after": github_after,
+            "github_pr": github_pr,
         }
     decision_payload = plan.get("decision", {}).get("payload", {})
     prompt_file = decision_payload.get("prompt_file")
@@ -229,6 +290,10 @@ def loop_turn(repo: Path, *, execute: bool) -> dict[str, Any]:
         else:
             for _ in range(max(1, missing)):
                 plan = plan_next(config.repo_root)
+                mission = plan.get("chosen", {}).get("mission")
+                if isinstance(mission, str) and mission:
+                    plan = dict(plan)
+                    plan["github_children"] = ensure_child_issues(config.repo_root, mission, execute=False)
                 if plan.get("status") == "discovery_needed":
                     promotion = promote_discovery(config.repo_root, execute=False)
                     if promotion.get("status") == "planned":

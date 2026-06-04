@@ -16,6 +16,12 @@ sys.modules["backend_common"] = backend_common
 COMMON_SPEC.loader.exec_module(backend_common)
 sys.modules["backend_common"] = backend_common
 
+GITHUB_SPEC = importlib.util.spec_from_file_location("github_sync", SCRIPT_DIR / "github_sync.py")
+github_sync = importlib.util.module_from_spec(GITHUB_SPEC)
+assert GITHUB_SPEC and GITHUB_SPEC.loader
+sys.modules["github_sync"] = github_sync
+GITHUB_SPEC.loader.exec_module(github_sync)
+
 SPEC = importlib.util.spec_from_file_location("spec_backend", SCRIPT_DIR / "spec_backend.py")
 spec_backend = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
@@ -153,7 +159,7 @@ class SpecBackendTests(unittest.TestCase):
             }
             with mock.patch.object(spec_backend, "choose_mission", return_value=chosen), mock.patch.object(
                 spec_backend, "next_decision", return_value=decision
-            ):
+            ), mock.patch.object(spec_backend, "ensure_child_issues", return_value={"status": "planned"}):
                 plan = spec_backend.plan_next(repo)
 
         self.assertEqual(plan["status"], "ready")
@@ -207,6 +213,40 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["execution_kind"], "kitty-agent-action")
         self.assertEqual(plan["action"], "review")
         self.assertEqual(plan["action_command"], ["spec-kitty", "agent", "action", "review", "WP02", "--mission", "001-demo", "--agent", "codex"])
+
+    def test_plan_next_adds_github_child_issue_plan_for_wp_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport SPEC_KITTY_AGENT="codex"\n',
+                encoding="utf-8",
+            )
+            chosen = {
+                "mission": "001-demo",
+                "state": {
+                    "payload": {
+                        "success": True,
+                        "data": {
+                            "summary": {"planned": 1},
+                            "work_packages": [{"wp_id": "WP01", "lane": "planned"}],
+                        },
+                    }
+                },
+            }
+            decision = {
+                "returncode": 0,
+                "payload": {"success": True, "data": {}, "reason": "no next step"},
+                "stderr": "",
+            }
+            with mock.patch.object(spec_backend, "choose_mission", return_value=chosen), mock.patch.object(
+                spec_backend, "next_decision", return_value=decision
+            ), mock.patch.object(spec_backend, "ensure_child_issues", return_value={"status": "planned"}) as ensure:
+                plan = spec_backend.plan_next(repo)
+
+        self.assertEqual(plan["execution_kind"], "kitty-agent-action")
+        self.assertEqual(plan["github_sync"]["status"], "planned")
+        ensure.assert_called_once_with(repo.resolve(), "001-demo", execute=False)
 
 
 if __name__ == "__main__":

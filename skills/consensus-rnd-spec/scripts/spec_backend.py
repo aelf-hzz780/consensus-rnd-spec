@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from backend_common import load_config, print_json
+from github_sync import ensure_child_issues
 
 PENDING_RESULT_FILE = "spec-kitty-pending-result.json"
 KITTY_NEXT_ACTIONS = {"research", "specify", "plan", "tasks", "tasks-outline", "tasks-packages", "analyze"}
@@ -439,6 +440,7 @@ def plan_next(repo: Path) -> dict[str, Any]:
     wp_plan = wp_action_from_chosen(chosen, str(mission), config.spec_kitty_agent)
     if wp_plan is not None:
         wp_plan["decision"] = decision
+        wp_plan["github_sync"] = ensure_child_issues(config.repo_root, str(mission), execute=False)
         return wp_plan
     return {
         "backend": "spec-kitty",

@@ -83,6 +83,7 @@ jobs:
         run: |
           skill_root=".native-backend/consensus-rnd/skills/codex-refactor-loop"
           python3 skills/consensus-rnd-spec/scripts/native_capabilities.py --skill-root "$skill_root"
+          python3 skills/consensus-rnd-spec/scripts/upstream_contract.py --upstream-skill-root "$skill_root"
           if [ -x "$skill_root/scripts/consensus-rnd-cli" ]; then
             python3 "$skill_root/scripts/consensus-rnd-cli" check-degradation --static --repo-root .native-backend/consensus-rnd
             python3 -c 'from pathlib import Path; import importlib.util; spec = importlib.util.spec_from_file_location("native_capabilities", "skills/consensus-rnd-spec/scripts/native_capabilities.py"); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module); payload = module.detect_native_capabilities(Path(".native-backend/consensus-rnd/skills/codex-refactor-loop")); assert payload["controller_surface"]["cli"]["supports_latest_controller"], payload; assert payload["controller_surface"]["wakeup_runner"]["exists"], payload'
