@@ -564,8 +564,40 @@ def wp_files(mission_path: Path) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     for path in sorted(tasks.glob("WP*.md")):
         wp_id = path.name.split("-", 1)[0]
-        items.append({"wp_id": wp_id, "path": str(path), "title": path.stem})
+        items.append({"wp_id": wp_id, "path": str(path), "title": wp_prompt_title(path, wp_id)})
     return items
+
+
+def wp_prompt_title(path: Path, wp_id: str) -> str:
+    fallback = path.stem.split("-", 1)[1].replace("-", " ") if "-" in path.stem else path.stem
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    if not text.startswith("---"):
+        return fallback
+    for line in text.splitlines()[1:80]:
+        if line.strip() == "---":
+            break
+        match = re.match(r"\s*title:\s*(.+?)\s*$", line)
+        if match:
+            value = match.group(1).strip().strip('"').strip("'")
+            return value or fallback
+    return fallback
+
+
+def child_issue_title(mission: str, wp: dict[str, str]) -> str:
+    wp_id = wp["wp_id"]
+    readable = wp.get("title") or wp_id
+    prefix = f"{wp_id}: {readable}"
+    suffix = f" ({mission})"
+    max_len = 96
+    if len(prefix) + len(suffix) <= max_len:
+        return prefix + suffix
+    remaining = max_len - len(prefix) - 4
+    if remaining <= 12:
+        return prefix[:max_len]
+    return f"{prefix} ({mission[:remaining]}...)"
 
 
 def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
@@ -597,7 +629,7 @@ def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> d
             continue
         body = build_child_issue_body(mission, wp, str(parent_issue), str(bindings.get("mission_pr", {}).get("number") or ""))
         body_file = write_body_file(path, f"{wp_id}-issue.md", body)
-        title = f"{mission} {wp_id}: {wp['title']}"[:96]
+        title = child_issue_title(mission, wp)
         command = [
             "gh",
             "issue",
