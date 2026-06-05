@@ -883,6 +883,10 @@ def source_contract() -> dict[str, Any]:
     }
 
 
+def exit_code_for_result(result: dict[str, Any]) -> int:
+    return 1 if result.get("status") in {"blocked", "failed", "error"} else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -911,16 +915,17 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = Path(args.repo).resolve()
     if args.command == "ensure-parent":
-        print_json(ensure_parent_issue(repo, args.mission, execute=args.execute))
+        result = ensure_parent_issue(repo, args.mission, execute=args.execute)
     elif args.command == "ensure-children":
-        print_json(ensure_child_issues(repo, args.mission, execute=args.execute))
+        result = ensure_child_issues(repo, args.mission, execute=args.execute)
     elif args.command == "sync-wp-status":
-        print_json(sync_wp_status(repo, args.mission, args.wp_id, args.phase, detail=args.detail, execute=args.execute))
+        result = sync_wp_status(repo, args.mission, args.wp_id, args.phase, detail=args.detail, execute=args.execute)
     elif args.command == "open-pr":
-        print_json(open_or_update_mission_pr(repo, args.mission, execute=args.execute))
+        result = open_or_update_mission_pr(repo, args.mission, execute=args.execute)
     else:
-        print_json(source_contract())
-    return 0
+        result = source_contract()
+    print_json(result)
+    return exit_code_for_result(result)
 
 
 if __name__ == "__main__":

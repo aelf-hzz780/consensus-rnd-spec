@@ -233,6 +233,45 @@ class GitHubSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertIn("gh CLI not found", result["reason"])
 
+    def test_cli_returns_nonzero_for_blocked_result(self) -> None:
+        with mock.patch.object(github_sync, "sync_wp_status", return_value={"status": "blocked", "reason": "gh auth status failed"}), mock.patch.object(
+            github_sync, "print_json"
+        ):
+            rc = github_sync.main(
+                [
+                    "sync-wp-status",
+                    "--repo",
+                    ".",
+                    "--mission",
+                    "001-demo",
+                    "--wp-id",
+                    "WP01",
+                    "--phase",
+                    github_sync.PHASE_REVIEWING,
+                    "--execute",
+                ]
+            )
+
+        self.assertEqual(rc, 1)
+
+    def test_cli_returns_zero_for_planned_result(self) -> None:
+        with mock.patch.object(github_sync, "sync_wp_status", return_value={"status": "planned"}), mock.patch.object(github_sync, "print_json"):
+            rc = github_sync.main(
+                [
+                    "sync-wp-status",
+                    "--repo",
+                    ".",
+                    "--mission",
+                    "001-demo",
+                    "--wp-id",
+                    "WP01",
+                    "--phase",
+                    github_sync.PHASE_REVIEWING,
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+
     def test_open_or_update_mission_pr_reuses_existing_pr_and_refreshes_body(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
