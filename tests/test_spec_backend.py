@@ -294,6 +294,123 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["github_sync"]["status"], "planned")
         ensure.assert_called_once_with(repo.resolve(), "001-demo", execute=False)
 
+    def test_approved_code_lane_plan_excludes_planning_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                """
+{
+  "mission_slug": "001-demo",
+  "mission_branch": "kitty/mission-001-demo",
+  "target_branch": "feature/demo",
+  "lanes": [
+    {"lane_id": "lane-a", "wp_ids": ["WP01"]},
+    {"lane_id": "lane-planning", "wp_ids": ["WP02"]}
+  ]
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text(
+                '{"wp_id":"WP01","to_lane":"approved"}\n{"wp_id":"WP02","to_lane":"approved"}\n',
+                encoding="utf-8",
+            )
+
+            plan = spec_backend.approved_code_lane_plan(repo, "001-demo")
+
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual([lane["lane_id"] for lane in plan["lanes"]], ["lane-a"])
+        self.assertEqual(plan["blockers"][0]["lane_id"], "lane-planning")
+
+    def test_approved_code_lane_plan_blocks_unapproved_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01","WP02"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text(
+                '{"wp_id":"WP01","to_lane":"approved"}\n{"wp_id":"WP02","to_lane":"in_progress"}\n',
+                encoding="utf-8",
+            )
+
+            plan = spec_backend.approved_code_lane_plan(repo, "001-demo")
+
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["blockers"][0]["missing"], ["WP02"])
+        self.assertEqual(plan["blockers"][0]["lanes"]["WP02"], "in_progress")
+
+    def test_integrate_approved_lanes_dry_run_does_not_call_merge_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text('{"wp_id":"WP01","to_lane":"approved"}\n', encoding="utf-8")
+            with mock.patch.object(spec_backend.subprocess, "run") as run:
+                result = spec_backend.integrate_approved_lanes(repo, "001-demo", execute=False)
+
+        self.assertEqual(result["status"], "planned")
+        run.assert_not_called()
+
+    def test_integrate_approved_lanes_blocks_dirty_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text('{"wp_id":"WP01","to_lane":"approved"}\n', encoding="utf-8")
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                if command == ["git", "status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M src/app.ts\n?? .kittify/derived/demo/status.json\n", stderr="")
+                raise AssertionError(command)
+
+            with mock.patch.object(spec_backend.subprocess, "run", side_effect=fake_run):
+                result = spec_backend.integrate_approved_lanes(repo, "001-demo", execute=True)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(" M src/app.ts", result["dirty"])
+        self.assertNotIn("?? .kittify/derived/demo/status.json", result["dirty"])
+
+    def test_ensure_spec_kitty_import_path_uses_cli_shebang(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "tool" / "bin"
+            package_dir = root / "tool" / "lib" / "python3.11" / "site-packages" / "specify_cli"
+            bin_dir.mkdir(parents=True)
+            package_dir.mkdir(parents=True)
+            fake_python = bin_dir / "python3"
+            fake_python.write_text("", encoding="utf-8")
+            spec_kitty = bin_dir / "spec-kitty"
+            spec_kitty.write_text(f"#!{fake_python}\n", encoding="utf-8")
+            spec_kitty.chmod(0o755)
+            (package_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+            old_path = list(sys.path)
+            sys.modules.pop("specify_cli", None)
+            with mock.patch.object(spec_backend.shutil, "which", return_value=str(spec_kitty)):
+                ok = spec_backend.ensure_spec_kitty_import_path()
+
+            self.assertTrue(ok)
+            self.assertIn(str(package_dir.parent), sys.path)
+            sys.modules.pop("specify_cli", None)
+            sys.path[:] = old_path
+
 
 if __name__ == "__main__":
     unittest.main()
