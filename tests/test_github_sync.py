@@ -257,6 +257,10 @@ class GitHubSyncTests(unittest.TestCase):
                     "mission_pr": {},
                 },
             )
+            (mission_dir / "status.json").write_text(
+                json.dumps({"work_packages": {"WP01": {"lane": "in_progress"}}}) + "\n",
+                encoding="utf-8",
+            )
             (repo / ".consensus-rnd-spec").mkdir()
             (repo / ".consensus-rnd-spec" / "host.env").write_text(
                 f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
@@ -354,6 +358,85 @@ class GitHubSyncTests(unittest.TestCase):
         self.assertIn("Closes #42", body)
         self.assertFalse(any(command[:3] == ["gh", "pr", "create"] for command in calls))
         self.assertTrue(any(command[:3] == ["gh", "pr", "edit"] and "--body-file" in command for command in calls))
+
+    def test_open_or_update_mission_pr_does_not_use_wp_lane_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = "001-demo"
+            mission_dir = make_mission(repo, mission=mission, source_issue="42")
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}},
+                    "mission_pr": {},
+                },
+            )
+            workspace_dir = repo / ".kittify" / "workspaces"
+            workspace_dir.mkdir(parents=True)
+            (workspace_dir / f"{mission}-lane-a.json").write_text(
+                json.dumps(
+                    {
+                        "mission_slug": mission,
+                        "branch_name": f"kitty/mission-{mission}-lane-a",
+                        "base_branch": f"kitty/mission-{mission}",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "branch_has_commits", side_effect=lambda _repo, branch, _base: branch.endswith("-lane-a")
+            ), mock.patch.object(github_sync, "github_write_preflight") as preflight, mock.patch.object(github_sync, "run_command") as run_command:
+                result = github_sync.open_or_update_mission_pr(repo, mission, execute=False)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "mission branch has no commits or cannot be resolved")
+        self.assertNotIn(f"kitty/mission-{mission}-lane-a", github_sync.candidate_mission_branches(repo, mission))
+        preflight.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_open_or_update_mission_pr_rejects_explicit_wp_lane_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = "001-demo"
+            mission_dir = make_mission(repo, mission=mission, source_issue="42")
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(github_sync, "github_write_preflight") as preflight, mock.patch.object(
+                github_sync, "run_command"
+            ) as run_command:
+                result = github_sync.open_or_update_mission_pr(
+                    repo,
+                    mission,
+                    head_override=f"kitty/mission-{mission}-lane-a",
+                    execute=False,
+                )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "mission PR head must be a mission branch, not a WP lane branch")
+        preflight.assert_not_called()
+        run_command.assert_not_called()
 
 
 if __name__ == "__main__":
