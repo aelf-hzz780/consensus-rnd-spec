@@ -139,6 +139,35 @@ class GitHubSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "created")
         self.assertEqual(bindings["parent_issue"]["number"], "42")
 
+    def test_parent_issue_does_not_reuse_source_issue_bound_as_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            existing = make_mission(repo, "020-existing")
+            github_sync.write_bindings(
+                existing,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "9"},
+                    "child_issues": {"WP04": {"number": "10"}},
+                    "mission_pr": {},
+                },
+            )
+            make_mission(repo, "021-next", source_issue="10")
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(github_sync, "run_command") as run_command:
+                result = github_sync.ensure_parent_issue(repo, "021-next", execute=False)
+                source_issue_is_child = github_sync.is_issue_bound_as_child(repo, "10")
+
+        self.assertTrue(source_issue_is_child)
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(result["command"][:3], ["gh", "issue", "create"])
+        run_command.assert_not_called()
+
     def test_label_catalog_dry_run_plans_without_gh_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

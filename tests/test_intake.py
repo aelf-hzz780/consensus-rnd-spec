@@ -47,6 +47,17 @@ class IntakeTests(unittest.TestCase):
             "16.Cockpit Production Contract Closure and Durable Query Trust",
         )
 
+    def test_title_from_intake_preserves_mission_number_prefix(self) -> None:
+        parsed = intake.parse_intake(
+            "/loop 10min /codex-refactor-loop Mission 21: Cockpit Empty Dataset Trust, "
+            "CI Retry Gate, and Evidence Closure"
+        )
+
+        self.assertEqual(
+            intake.title_from_intake(parsed),
+            "21.Cockpit Empty Dataset Trust, CI Retry Gate, and Evidence Closure",
+        )
+
     def test_parse_slash_intake_normalizes_embedded_human_marker(self) -> None:
         parsed = intake.parse_intake("/loop 10min /codex-refactor-loop reload skills Human\uff1a fix bugs")
 

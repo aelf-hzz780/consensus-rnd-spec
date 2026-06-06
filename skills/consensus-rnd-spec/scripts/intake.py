@@ -19,6 +19,7 @@ SURFACE_RE = re.compile(r"/(?:codex-refactor-loop|consensus-rnd-spec)\b")
 LOOP_RE = re.compile(r"/loop(?:\s+([^\s/]+))?")
 MARKDOWN_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 TITLE_FIELD_RE = re.compile(r"^\s*Title\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+MISSION_TITLE_RE = re.compile(r"^\s*(?:mission\s+)?(\d+)\s*[:.]\s*(.+?)\s*$", re.IGNORECASE)
 
 
 def normalize_text(text: str) -> str:
@@ -101,6 +102,10 @@ def title_from_intake(parsed: dict[str, Any]) -> str:
     compact = collapse_ws(instructions)
     if compact.startswith("Human:"):
         compact = compact[len("Human:") :].strip()
+    mission_title = MISSION_TITLE_RE.match(compact)
+    if mission_title:
+        number, title = mission_title.groups()
+        return f"{number}.{title.strip()}"[:96]
     return f"consensus intake: {compact}"[:96]
 
 

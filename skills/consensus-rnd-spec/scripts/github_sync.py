@@ -499,6 +499,23 @@ def existing_source_issue(source: dict[str, Any]) -> str:
     return str(value) if value else ""
 
 
+def is_issue_bound_as_child(repo: Path, issue_number: str) -> bool:
+    if not issue_number:
+        return False
+    specs_dir = repo / "kitty-specs"
+    if not specs_dir.is_dir():
+        return False
+    for path in specs_dir.glob("*/consensus-rnd/github-bindings.json"):
+        bindings = load_json(path)
+        children = bindings.get("child_issues") if isinstance(bindings, dict) else None
+        if not isinstance(children, dict):
+            continue
+        for child in children.values():
+            if isinstance(child, dict) and str(child.get("number") or "") == issue_number:
+                return True
+    return False
+
+
 def write_body_file(mission_path: Path, name: str, body: str) -> Path:
     out_dir = mission_path / "consensus-rnd" / "github"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -519,6 +536,8 @@ def ensure_parent_issue(repo: Path, mission: str, *, execute: bool = False) -> d
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     source = mission_source(path)
     source_issue = existing_source_issue(source)
+    if source_issue and is_issue_bound_as_child(config.repo_root, source_issue):
+        source_issue = ""
     title = mission_title(mission, source)
     if source_issue:
         parent = {"number": source_issue, "source": "source_issue", "title": title}
