@@ -28,6 +28,10 @@ COCKPIT_RUNTIME_CORS_REQUIRED_FILES = (
 COCKPIT_API_DTO_CONTRACT_REQUIRED_FILES = (
     "apps/cockpit-api/tests/cockpit-api.test.ts",
 )
+COCKPIT_DURABLE_QUERY_PROOF_REQUIRED_FILES = (
+    "packages/cockpit-infrastructure/src/postgres.ts",
+    "packages/cockpit-infrastructure/tests/cockpit-postgres-storage.test.ts",
+)
 
 
 def evidence_hash(text: str) -> str:
@@ -425,6 +429,37 @@ def audit_wp_owned_files(repo: Path, mission: str, wp_id: str) -> dict[str, Any]
                     "wp_path": str(path),
                     "missing_owned_files": missing,
                     "suggestion": "Update the Spec Kitty WP ownership artifacts before dispatching implementation, or split the API contract-test work into a WP that owns these files.",
+                }
+            )
+
+    mentions_durable_query_proof = (
+        "cockpit" in normalized
+        and (
+            "release gate" in normalized
+            or "semantic release" in normalized
+            or "durability proof" in normalized
+            or "durable storage" in normalized
+        )
+        and (
+            "keyset" in normalized
+            or "offset-only" in normalized
+            or "offset cursor" in normalized
+            or "postgresql" in normalized
+            or "postgres" in normalized
+            or "durable sql" in normalized
+        )
+    )
+    if mentions_durable_query_proof:
+        missing = [required for required in COCKPIT_DURABLE_QUERY_PROOF_REQUIRED_FILES if not path_is_owned(owned, required)]
+        if missing:
+            checks.append(
+                {
+                    "status": "blocked",
+                    "rule": "cockpit-durable-query-proof-ownership",
+                    "reason": "WP prompt requires semantic durable query/keyset release proof but owned_files omit PostgreSQL implementation/test files",
+                    "wp_path": str(path),
+                    "missing_owned_files": missing,
+                    "suggestion": "Update the Spec Kitty WP ownership artifacts before dispatching implementation, or split the durable SQL proof into a WP that owns these files.",
                 }
             )
 

@@ -355,6 +355,39 @@ Update API DTO parsing for the sort query parameter and add application/API cont
             ["apps/cockpit-api/tests/cockpit-api.test.ts"],
         )
 
+    def test_audit_wp_owned_files_blocks_durable_query_proof_without_postgres_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP04-release-gate.md").write_text(
+                """---
+work_package_id: WP04
+owned_files:
+- scripts/schema-validate.mjs
+- tests/gates/release-gate-scripts.test.ts
+---
+
+# WP04
+
+Upgrade the Cockpit semantic release gate and durability proof so PostgreSQL
+durable SQL cannot remain offset-only when the shared keyset contract exists.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP04")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-durable-query-proof-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            [
+                "packages/cockpit-infrastructure/src/postgres.ts",
+                "packages/cockpit-infrastructure/tests/cockpit-postgres-storage.test.ts",
+            ],
+        )
+
     def test_plan_next_blocks_wp_action_when_owned_files_preflight_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
