@@ -436,7 +436,18 @@ def build_mission_pr_body(mission: str, parent_issue: str, child_issues: dict[st
     for wp_id in sorted(child_issues):
         issue = child_issues.get(wp_id, {}).get("number")
         lines.append(f"- `{wp_id}`: #{issue}" if issue else f"- `{wp_id}`: pending")
-    lines.extend(["", f"Closes #{parent_issue}"])
+    lines.extend(
+        [
+            "",
+            "## Closure Guard",
+            "",
+            "Do not auto-close the parent issue from the PR body. Issue closure is",
+            "controlled by `mark-merged` after it verifies merged PR evidence and",
+            "updates parent/child projection state.",
+            "",
+            f"Related: #{parent_issue}",
+        ]
+    )
     return ensure_sentinel("\n".join(lines))
 
 
@@ -1042,7 +1053,33 @@ def post_commentary(
     }
 
 
+FINAL_BRANCH_PATTERNS = (
+    re.compile(r"(?im)^\s*-\s*(?:Final merge target|Planning/base branch)\s*:\s*`([^`]+)`"),
+    re.compile(r"(?im)^\s*-\s*GitHub mission PR base and final landing branch\s*:\s*`([^`]+)`"),
+    re.compile(r"(?im)^\s*-\s*Base branch\s*:\s*`([^`]+)`"),
+)
+
+
+def final_landing_branch_for_mission(mission_path: Path) -> str:
+    for relative in ("plan.md", "spec.md", "consensus-rnd/intake.md"):
+        path = mission_path / relative
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for pattern in FINAL_BRANCH_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
 def target_branch_for_mission(mission_path: Path) -> str:
+    final_branch = final_landing_branch_for_mission(mission_path)
+    if final_branch:
+        return final_branch
     meta = load_json(mission_path / "meta.json")
     value = meta.get("target_branch")
     return str(value) if value else "main"
@@ -1052,8 +1089,15 @@ def is_spec_kitty_lane_branch(branch: str) -> bool:
     return "-lane-" in branch
 
 
-def candidate_mission_branches(repo: Path, mission: str) -> list[str]:
+def meta_target_branch_for_mission(mission_path: Path) -> str:
+    meta = load_json(mission_path / "meta.json")
+    value = meta.get("target_branch")
+    return str(value).strip() if value else ""
+
+
+def candidate_mission_branches(repo: Path, mission: str, mission_path: Path | None = None) -> list[str]:
     branches = [
+        meta_target_branch_for_mission(mission_path) if mission_path else "",
         f"kitty/{mission}",
         f"kitty/mission-{mission}",
         f"codex/{mission}",
@@ -1078,13 +1122,39 @@ def branch_has_commits(repo: Path, branch: str, base: str) -> bool:
         return False
 
 
-def resolve_mission_branch(repo: Path, mission: str, base: str, *, explicit_head: str = "") -> str:
+def github_base_validation_ref(repo: Path, base: str) -> str:
+    """Use the remote-tracking PR base when available.
+
+    A controller workspace may have a local ``feature/*`` branch advanced to
+    the candidate head while GitHub's PR base is still ``origin/feature/*``.
+    Validate PR head commits against the remote-tracking base to match GitHub's
+    comparison semantics.
+    """
+    origin_base = f"origin/{base}"
+    return origin_base if branch_exists(repo, origin_base) else base
+
+
+def branch_or_origin_ref_has_commits(repo: Path, branch: str, base: str) -> bool:
+    """Return True when a local branch or its origin tracking ref has commits.
+
+    GitHub PR heads are often remote-only from the controller workspace after a
+    push. Keep the public GitHub head as ``branch`` while using
+    ``origin/<branch>`` only for local git validation.
+    """
+    validation_base = github_base_validation_ref(repo, base)
+    if branch_exists(repo, branch) and branch_has_commits(repo, branch, validation_base):
+        return True
+    origin_branch = f"origin/{branch}"
+    return branch_exists(repo, origin_branch) and branch_has_commits(repo, origin_branch, validation_base)
+
+
+def resolve_mission_branch(repo: Path, mission: str, base: str, *, explicit_head: str = "", mission_path: Path | None = None) -> str:
     if explicit_head:
         if is_spec_kitty_lane_branch(explicit_head):
             return ""
-        return explicit_head if branch_exists(repo, explicit_head) and branch_has_commits(repo, explicit_head, base) else ""
-    for branch in candidate_mission_branches(repo, mission):
-        if branch_has_commits(repo, branch, base):
+        return explicit_head if branch_or_origin_ref_has_commits(repo, explicit_head, base) else ""
+    for branch in candidate_mission_branches(repo, mission, mission_path=mission_path):
+        if branch_or_origin_ref_has_commits(repo, branch, base):
             return branch
     return ""
 
@@ -1100,7 +1170,7 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, head_override: str = 
             "base": base,
             "head_override": head_override,
         }
-    head = resolve_mission_branch(config.repo_root, mission, base, explicit_head=head_override)
+    head = resolve_mission_branch(config.repo_root, mission, base, explicit_head=head_override, mission_path=path)
     if not head:
         reason = "explicit head branch does not exist or has no commits" if head_override else "mission branch has no commits or cannot be resolved"
         return {"status": "blocked", "reason": reason, "base": base, "head_override": head_override}

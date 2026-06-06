@@ -84,10 +84,68 @@ class GitHubSyncTests(unittest.TestCase):
     def test_pr_body_has_exactly_one_parent_closes_link(self) -> None:
         body = github_sync.build_mission_pr_body("001-demo", "9", {"WP01": {"number": "10"}, "WP02": {"number": "11"}})
 
-        self.assertEqual(len(github_sync.PR_CLOSES_RE.findall(body)), 1)
-        self.assertIn("Closes #9", body)
+        self.assertEqual(len(github_sync.PR_CLOSES_RE.findall(body)), 0)
+        self.assertIn("Related: #9", body)
+        self.assertIn("Closure Guard", body)
         self.assertIn("`WP01`: #10", body)
         self.assertTrue(body.rstrip().endswith("⟦AI:AUTO-LOOP⟧"))
+
+    def test_target_branch_prefers_final_landing_branch_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo)
+            (mission_dir / "meta.json").write_text(
+                json.dumps({"slug": "001-demo", "target_branch": "codex/mission-001-demo"}) + "\n",
+                encoding="utf-8",
+            )
+            (mission_dir / "plan.md").write_text(
+                "- GitHub mission PR base and final landing branch: `feature/cockpit`\n",
+                encoding="utf-8",
+            )
+
+            branch = github_sync.target_branch_for_mission(mission_dir)
+
+        self.assertEqual(branch, "feature/cockpit")
+
+    def test_open_pr_uses_meta_target_branch_as_head_when_base_is_final_landing_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = "24-cockpit-viewport-level-mobile-regression-gate-hardening-01KTFCZ2"
+            mission_dir = make_mission(repo, mission=mission, source_issue="42")
+            (mission_dir / "meta.json").write_text(
+                json.dumps({"slug": mission, "target_branch": "codex/24-cockpit-viewport-regression-gate"}) + "\n",
+                encoding="utf-8",
+            )
+            (mission_dir / "spec.md").write_text("- Base branch: `feature/cockpit`\n", encoding="utf-8")
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync,
+                "branch_or_origin_ref_has_commits",
+                side_effect=lambda _repo, branch, base: branch == "codex/24-cockpit-viewport-regression-gate" and base == "feature/cockpit",
+            ), mock.patch.object(github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}), mock.patch.object(
+                github_sync, "run_command"
+            ) as run_command:
+                result = github_sync.open_or_update_mission_pr(repo, mission, execute=False)
+
+        self.assertEqual(result["status"], "planned")
+        create_command = result["create_command"]
+        self.assertEqual(create_command[create_command.index("--base") + 1], "feature/cockpit")
+        self.assertEqual(create_command[create_command.index("--head") + 1], "codex/24-cockpit-viewport-regression-gate")
+        run_command.assert_not_called()
 
     def test_config_defaults_github_sync_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,8 +412,8 @@ class GitHubSyncTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["mission_pr"]["number"], "7")
-        self.assertEqual(len(github_sync.PR_CLOSES_RE.findall(body)), 1)
-        self.assertIn("Closes #42", body)
+        self.assertEqual(len(github_sync.PR_CLOSES_RE.findall(body)), 0)
+        self.assertIn("Related: #42", body)
         self.assertFalse(any(command[:3] == ["gh", "pr", "create"] for command in calls))
         self.assertTrue(any(command[:3] == ["gh", "pr", "edit"] and "--body-file" in command for command in calls))
 
@@ -399,7 +457,7 @@ class GitHubSyncTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "mission branch has no commits or cannot be resolved")
-        self.assertNotIn(f"kitty/mission-{mission}-lane-a", github_sync.candidate_mission_branches(repo, mission))
+        self.assertNotIn(f"kitty/mission-{mission}-lane-a", github_sync.candidate_mission_branches(repo, mission, mission_path=mission_dir))
         preflight.assert_not_called()
         run_command.assert_not_called()
 
