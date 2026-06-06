@@ -326,6 +326,35 @@ Implement production restricted CORS config validation for COCKPIT_CORS_ALLOWED_
             ],
         )
 
+    def test_audit_wp_owned_files_blocks_api_contract_tests_without_api_test_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP03-sort.md").write_text(
+                """---
+work_package_id: WP03
+owned_files:
+- apps/cockpit-api/src/dto.ts
+- apps/cockpit-api/src/validation.ts
+---
+
+# WP03
+
+Update API DTO parsing for the sort query parameter and add application/API contract tests.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP03")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-api-contract-test-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            ["apps/cockpit-api/tests/cockpit-api.test.ts"],
+        )
+
     def test_plan_next_blocks_wp_action_when_owned_files_preflight_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

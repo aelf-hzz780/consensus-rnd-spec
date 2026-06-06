@@ -25,6 +25,9 @@ COCKPIT_RUNTIME_CORS_REQUIRED_FILES = (
     "apps/cockpit-api/src/runtime-config.ts",
     "apps/cockpit-api/tests/cockpit-runtime-entry.test.ts",
 )
+COCKPIT_API_DTO_CONTRACT_REQUIRED_FILES = (
+    "apps/cockpit-api/tests/cockpit-api.test.ts",
+)
 
 
 def evidence_hash(text: str) -> str:
@@ -396,6 +399,32 @@ def audit_wp_owned_files(repo: Path, mission: str, wp_id: str) -> dict[str, Any]
                     "wp_path": str(path),
                     "missing_owned_files": missing,
                     "suggestion": "Update the Spec Kitty WP ownership artifacts before dispatching implementation, or split the config-validation work into a WP that owns these files.",
+                }
+            )
+
+    mentions_cockpit_api_contract_tests = (
+        "cockpit" in normalized
+        and "api" in normalized
+        and (
+            "dto parsing" in normalized
+            or "api parsing" in normalized
+            or "api contract tests" in normalized
+            or "application/api contract tests" in normalized
+            or "parse `sort` query parameter" in normalized
+            or "parse sort query parameter" in normalized
+        )
+    )
+    if mentions_cockpit_api_contract_tests:
+        missing = [required for required in COCKPIT_API_DTO_CONTRACT_REQUIRED_FILES if not path_is_owned(owned, required)]
+        if missing:
+            checks.append(
+                {
+                    "status": "blocked",
+                    "rule": "cockpit-api-contract-test-ownership",
+                    "reason": "WP prompt requires Cockpit API parsing/contract tests but owned_files omit the API test file",
+                    "wp_path": str(path),
+                    "missing_owned_files": missing,
+                    "suggestion": "Update the Spec Kitty WP ownership artifacts before dispatching implementation, or split the API contract-test work into a WP that owns these files.",
                 }
             )
 
