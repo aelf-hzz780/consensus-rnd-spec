@@ -166,6 +166,8 @@ class RunLoopTests(unittest.TestCase):
     def test_execute_kitty_next_step_runs_prompt_and_records_pending_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
+            mission_dir = repo / "kitty-specs" / "001-demo"
+            (mission_dir / "research").mkdir(parents=True)
             prompt = repo / "kitty-prompt.md"
             prompt.write_text("Implement the Spec Kitty discovery step.\n", encoding="utf-8")
             plan = {
@@ -181,6 +183,10 @@ class RunLoopTests(unittest.TestCase):
                 if command[:2] == ["spec-kitty", "next"]:
                     return {"command": command, "returncode": 0, "stdout_tail": next_stdout, "stderr_tail": ""}
                 if command[:2] == ["codex", "exec"]:
+                    (mission_dir / "research.md").write_text("Research findings.\n", encoding="utf-8")
+                    (mission_dir / "data-model.md").write_text("Data model.\n", encoding="utf-8")
+                    (mission_dir / "research" / "evidence-log.csv").write_text("source,finding\nlocal,ok\n", encoding="utf-8")
+                    (mission_dir / "research" / "source-register.csv").write_text("source,path\nlocal,repo\n", encoding="utf-8")
                     return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
                 raise AssertionError(command)
 
@@ -196,6 +202,38 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(pending["mission_slug"], "001-demo")
         self.assertEqual(pending["result"], "success")
         self.assertEqual(pending["completed_action"], "research")
+
+    def test_execute_kitty_next_step_does_not_record_success_when_worker_only_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs" / "001-demo").mkdir(parents=True)
+            prompt = repo / "kitty-prompt.md"
+            prompt.write_text("Run research.\n", encoding="utf-8")
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-next-step",
+                "chosen": {"mission": "001-demo"},
+                "advance_command": ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"],
+            }
+            next_stdout = json.dumps({"mission_slug": "001-demo", "action": "research", "prompt_file": str(prompt)})
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:2] == ["spec-kitty", "next"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": next_stdout, "stderr_tail": ""}
+                if command[:2] == ["codex", "exec"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "Implementation Plan\nPlease confirm.\n", "stderr_tail": ""}
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run):
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "worker-incomplete")
+        self.assertFalse(result["worker_completed"])
+        self.assertEqual(result["pending_result"]["status"], "not-recorded")
+        self.assertFalse((repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json").exists())
+        self.assertIn("research.md", result["pending_result"]["reason"])
 
     def test_execute_kitty_agent_action_runs_stdout_prompt_and_records_pending_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

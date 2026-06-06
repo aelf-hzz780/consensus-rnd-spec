@@ -1,6 +1,6 @@
 {
   "name": "consensus-rnd-spec",
-  "version": "0.1.0+codex.20260606155202",
+  "version": "0.1.0+codex.20260606160311",
   "description": "Consensus R&D loop with Spec Kitty and native consensus backends",
   "author": {
     "name": "aelf"

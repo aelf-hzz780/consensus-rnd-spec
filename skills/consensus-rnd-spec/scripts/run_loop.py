@@ -143,6 +143,38 @@ def worker_result_value(result: dict[str, Any]) -> str:
     return "failed"
 
 
+NEXT_STEP_REQUIRED_ARTIFACTS = {
+    "research": (
+        "research.md",
+        "data-model.md",
+        "research/evidence-log.csv",
+        "research/source-register.csv",
+    ),
+}
+
+
+def verify_next_step_worker_completion(
+    repo: Path,
+    plan: dict[str, Any],
+    decision_payload: dict[str, Any],
+    worker_result: dict[str, Any],
+) -> tuple[bool, str]:
+    if worker_result.get("returncode") != 0:
+        return False, "worker exited non-zero"
+    action = str(decision_payload.get("action") or plan.get("action") or "")
+    required = NEXT_STEP_REQUIRED_ARTIFACTS.get(action)
+    if not required:
+        return True, ""
+    mission = str(decision_payload.get("mission_slug") or plan_mission(plan) or "")
+    if not mission:
+        return False, "missing mission_slug for next-step artifact verification"
+    mission_path = repo / "kitty-specs" / mission
+    missing_or_empty = [item for item in required if not (mission_path / item).is_file() or (mission_path / item).stat().st_size == 0]
+    if missing_or_empty:
+        return False, f"worker did not create required {action} artifacts: {', '.join(missing_or_empty)}"
+    return True, ""
+
+
 def record_worker_pending(repo: Path, plan: dict[str, Any], worker_result: dict[str, Any], *, action: str | None = None) -> dict[str, Any]:
     decision_payload = plan.get("decision", {}).get("payload", {})
     mission = (
@@ -233,14 +265,28 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
         worker_command = codex_command(repo, str(prompt_file), config)
         worker_result = run_command(worker_command, repo)
         pending_plan = {**plan, "decision": {"payload": decision_payload}}
-        pending = record_worker_pending(repo, pending_plan, worker_result, action=decision_payload.get("action"))
+        worker_completed, incomplete_reason = verify_next_step_worker_completion(repo, plan, decision_payload, worker_result)
+        effective_worker_result = dict(worker_result)
+        exited_zero_without_completion = not worker_completed and worker_result.get("returncode") == 0
+        if not worker_completed and worker_result.get("returncode") == 0:
+            effective_worker_result["returncode"] = 1
+            effective_worker_result["stderr_tail"] = (
+                effective_worker_result.get("stderr_tail", "")
+                + f"\nWorker exited 0 but did not complete the Spec Kitty {decision_payload.get('action') or plan.get('action')} step: {incomplete_reason}."
+            )
+        pending = (
+            record_worker_pending(repo, pending_plan, effective_worker_result, action=decision_payload.get("action"))
+            if worker_completed or not exited_zero_without_completion
+            else {"status": "not-recorded", "reason": incomplete_reason}
+        )
         return {
-            "status": "worker-finished",
+            "status": "worker-finished" if worker_completed else "worker-incomplete",
             "execution_kind": execution_kind,
             "advance_result": advance_result,
             "decision": decision_payload,
-            "worker_result": worker_result,
+            "worker_result": effective_worker_result,
             "pending_result": pending,
+            "worker_completed": worker_completed,
         }
 
     if execution_kind == "kitty-prompt-file":

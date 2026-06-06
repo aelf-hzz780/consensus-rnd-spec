@@ -12,16 +12,22 @@ from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "consensus-rnd-spec" / "scripts"
 COMMON_SPEC = importlib.util.spec_from_file_location("backend_common", SCRIPT_DIR / "backend_common.py")
-backend_common = importlib.util.module_from_spec(COMMON_SPEC)
-assert COMMON_SPEC and COMMON_SPEC.loader
-sys.modules["backend_common"] = backend_common
-COMMON_SPEC.loader.exec_module(backend_common)
+if "backend_common" in sys.modules:
+    backend_common = sys.modules["backend_common"]
+else:
+    backend_common = importlib.util.module_from_spec(COMMON_SPEC)
+    assert COMMON_SPEC and COMMON_SPEC.loader
+    sys.modules["backend_common"] = backend_common
+    COMMON_SPEC.loader.exec_module(backend_common)
 
 SPEC = importlib.util.spec_from_file_location("github_sync", SCRIPT_DIR / "github_sync.py")
-github_sync = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-sys.modules["github_sync"] = github_sync
-SPEC.loader.exec_module(github_sync)
+if "github_sync" in sys.modules:
+    github_sync = sys.modules["github_sync"]
+else:
+    github_sync = importlib.util.module_from_spec(SPEC)
+    assert SPEC and SPEC.loader
+    sys.modules["github_sync"] = github_sync
+    SPEC.loader.exec_module(github_sync)
 
 
 def subprocess_completed(command: list[str], returncode: int, stdout: str, stderr: str):
