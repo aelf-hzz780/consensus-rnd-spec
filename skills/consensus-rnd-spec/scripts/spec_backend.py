@@ -21,6 +21,10 @@ KITTY_NEXT_ACTIONS = {"research", "specify", "plan", "tasks", "tasks-outline", "
 KITTY_AGENT_ACTIONS = {"implement", "review"}
 REVIEW_COMPLETE_LANES = {"approved", "done"}
 PLANNING_LANE_ID = "lane-planning"
+COCKPIT_RUNTIME_CORS_REQUIRED_FILES = (
+    "apps/cockpit-api/src/runtime-config.ts",
+    "apps/cockpit-api/tests/cockpit-runtime-entry.test.ts",
+)
 
 
 def evidence_hash(text: str) -> str:
@@ -306,6 +310,123 @@ def action_command(decision: dict[str, Any], agent: str) -> list[str] | None:
     return kitty_agent_action_command(str(action), str(mission), str(wp_id) if wp_id else None, agent)
 
 
+def wp_prompt_path(repo: Path, mission: str, wp_id: str) -> Path | None:
+    tasks = mission_dir(repo, mission) / "tasks"
+    if not tasks.is_dir():
+        return None
+    candidates = sorted(tasks.glob(f"{wp_id}-*.md"))
+    return candidates[0] if candidates else None
+
+
+def frontmatter_block(text: str) -> str:
+    if not text.startswith("---\n"):
+        return ""
+    end = text.find("\n---", 4)
+    if end == -1:
+        return ""
+    return text[4:end]
+
+
+def frontmatter_list(block: str, key: str) -> list[str]:
+    lines = block.splitlines()
+    values: list[str] = []
+    collecting = False
+    prefix = f"{key}:"
+    for line in lines:
+        if line.startswith(prefix):
+            collecting = True
+            remainder = line[len(prefix) :].strip()
+            if remainder.startswith("[") and remainder.endswith("]"):
+                return [item.strip().strip("\"'") for item in remainder[1:-1].split(",") if item.strip()]
+            continue
+        if not collecting:
+            continue
+        if line and not line.startswith((" ", "-")):
+            break
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            values.append(stripped[2:].strip().strip("\"'"))
+    return [value for value in values if value]
+
+
+def wp_owned_files(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return frontmatter_list(frontmatter_block(text), "owned_files")
+
+
+def path_is_owned(owned: list[str], required: str) -> bool:
+    for item in owned:
+        if item == required:
+            return True
+        if item.endswith("/**") and required.startswith(item[:-3].rstrip("/") + "/"):
+            return True
+    return False
+
+
+def audit_wp_owned_files(repo: Path, mission: str, wp_id: str) -> dict[str, Any]:
+    path = wp_prompt_path(repo, mission, wp_id)
+    if path is None:
+        return {"status": "ok", "checks": []}
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    normalized = text.lower()
+    owned = wp_owned_files(path)
+    checks: list[dict[str, Any]] = []
+
+    mentions_cockpit_cors_config = (
+        "production" in normalized
+        and "cors" in normalized
+        and (
+            "config validation" in normalized
+            or "runtime config" in normalized
+            or "cockpit_cors" in normalized
+            or "production restricted mode" in normalized
+        )
+    )
+    if mentions_cockpit_cors_config:
+        missing = [required for required in COCKPIT_RUNTIME_CORS_REQUIRED_FILES if not path_is_owned(owned, required)]
+        if missing:
+            checks.append(
+                {
+                    "status": "blocked",
+                    "rule": "cockpit-runtime-cors-config-ownership",
+                    "reason": "WP prompt requires production CORS config/runtime validation but owned_files omit runtime config files",
+                    "wp_path": str(path),
+                    "missing_owned_files": missing,
+                    "suggestion": "Update the Spec Kitty WP ownership artifacts before dispatching implementation, or split the config-validation work into a WP that owns these files.",
+                }
+            )
+
+    blocking = [check for check in checks if check.get("status") == "blocked"]
+    if blocking:
+        return {"status": "blocked", "reason": "WP owned_files preflight failed", "mission": mission, "wp_id": wp_id, "checks": checks}
+    return {"status": "ok", "mission": mission, "wp_id": wp_id, "checks": checks}
+
+
+def with_wp_preflight(repo: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    if plan.get("execution_kind") != "kitty-agent-action" or plan.get("action") != "implement":
+        return plan
+    chosen = plan.get("chosen")
+    mission = str(plan.get("decision", {}).get("payload", {}).get("mission_slug") or plan.get("mission") or "")
+    if not mission and isinstance(chosen, dict):
+        mission = str(chosen.get("mission") or "")
+    wp_id = str(plan.get("wp_id") or "")
+    if not mission or not wp_id:
+        return plan
+    audit = audit_wp_owned_files(repo, mission, wp_id)
+    if audit.get("status") == "blocked":
+        blocked = dict(plan)
+        blocked["status"] = "blocked"
+        blocked["reason"] = audit.get("reason")
+        blocked["action_command"] = None
+        blocked["preflight"] = audit
+        return blocked
+    plan["preflight"] = audit
+    return plan
+
+
 def pending_result_path(repo: Path) -> Path:
     return repo / ".consensus-rnd-spec" / "state" / PENDING_RESULT_FILE
 
@@ -472,12 +593,12 @@ def plan_next(repo: Path) -> dict[str, Any]:
     decision = next_decision(config.repo_root, str(mission), config.spec_kitty_agent)
     step_plan = next_step_plan(chosen, decision, config.spec_kitty_agent)
     if step_plan is not None:
-        return step_plan
+        return with_wp_preflight(config.repo_root, step_plan)
     wp_plan = wp_action_from_chosen(chosen, str(mission), config.spec_kitty_agent)
     if wp_plan is not None:
         wp_plan["decision"] = decision
         wp_plan["github_sync"] = ensure_child_issues(config.repo_root, str(mission), execute=False)
-        return wp_plan
+        return with_wp_preflight(config.repo_root, wp_plan)
     return {
         "backend": "spec-kitty",
         "status": "waiting",

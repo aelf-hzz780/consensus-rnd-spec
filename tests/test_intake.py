@@ -34,6 +34,19 @@ class IntakeTests(unittest.TestCase):
         self.assertEqual(parsed["instructions"], "fix bugs and reload skills")
         self.assertEqual(parsed["synthetic_human"], "Human: fix bugs and reload skills")
 
+    def test_parse_slash_intake_preserves_structured_lines_and_title_field(self) -> None:
+        parsed = intake.parse_intake(
+            "/loop 10min /consensus-rnd-spec Mission 16 follow-up.\n\n"
+            "Title: 16.Cockpit Production Contract Closure and Durable Query Trust\n\n"
+            "Scores:\n- Technical architecture: 6.5/10.\n"
+        )
+
+        self.assertIn("\n\nTitle:", parsed["instructions"])
+        self.assertEqual(
+            intake.title_from_intake(parsed),
+            "16.Cockpit Production Contract Closure and Durable Query Trust",
+        )
+
     def test_parse_slash_intake_normalizes_embedded_human_marker(self) -> None:
         parsed = intake.parse_intake("/loop 10min /codex-refactor-loop reload skills Human\uff1a fix bugs")
 
@@ -68,7 +81,7 @@ class IntakeTests(unittest.TestCase):
             ):
                 plan = intake.plan_intake(repo, f"/loop 10min /codex-refactor-loop {prompt}")
 
-        self.assertEqual(plan["seed"]["title"], "cockpit-readonly-dashboard")
+        self.assertEqual(plan["seed"]["title"], "多策略多账号 Twitter 驾驶舱方案")
         self.assertIn("# 多策略多账号 Twitter 驾驶舱方案", plan["seed"]["body"])
         self.assertEqual(plan["seed"]["metadata"]["prompt_file"]["path"], str(prompt.resolve()))
         self.assertEqual(plan["seed"]["metadata"]["branch_contract"]["primary"], "feature/cockpit")

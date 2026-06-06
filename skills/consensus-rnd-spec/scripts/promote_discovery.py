@@ -111,6 +111,28 @@ def record_promotion(repo: Path, event: dict[str, Any]) -> Path:
     return path
 
 
+def is_linked_worktree(repo: Path) -> bool:
+    git_path = repo / ".git"
+    if not git_path.is_file():
+        return False
+    try:
+        content = git_path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return False
+    return content.startswith("gitdir:")
+
+
+def spec_kitty_project_root_blocker(repo: Path) -> dict[str, Any] | None:
+    if not is_linked_worktree(repo):
+        return None
+    return {
+        "status": "blocked",
+        "reason": "spec-kitty mission promotion must run from the project root checkout, not a linked git worktree",
+        "repo_root": str(repo),
+        "next_step": "Re-run promotion from the project root checkout that owns .git as a directory.",
+    }
+
+
 def run_specify(repo: Path, title: str, mission_type: str) -> dict[str, Any]:
     command = ["spec-kitty", "specify", title, "--mission-type", mission_type, "--json"]
     result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
@@ -170,7 +192,8 @@ def write_mission_intake(mission_dir: Path, seed: dict[str, Any], source_payload
         "title": seed.get("title"),
         "synthetic_human_intake": source_payload.get("synthetic_human_intake", False),
     }
-    intake_path.write_text(str(seed.get("body") or ""), encoding="utf-8")
+    intake_body = str(source_payload.get("body") or seed.get("body") or "")
+    intake_path.write_text(intake_body, encoding="utf-8")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     meta_path = mission_dir / "meta.json"
@@ -224,6 +247,10 @@ def promote(repo: Path, *, artifact: Path | None = None, execute: bool = False) 
     }
     if not execute:
         return {"status": "planned", "seed": seed, "next_command": ["spec-kitty", "specify", title, "--mission-type", config.spec_kitty_mission_type, "--json"]}
+
+    root_blocker = spec_kitty_project_root_blocker(config.repo_root)
+    if root_blocker is not None:
+        return {"status": "blocked", "seed": seed, "blocker": root_blocker}
 
     specify = run_specify(config.repo_root, title, config.spec_kitty_mission_type)
     mission_dir = mission_dir_from_specify(specify)

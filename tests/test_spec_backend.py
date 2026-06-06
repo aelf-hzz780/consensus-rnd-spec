@@ -294,6 +294,87 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["github_sync"]["status"], "planned")
         ensure.assert_called_once_with(repo.resolve(), "001-demo", execute=False)
 
+    def test_audit_wp_owned_files_blocks_runtime_cors_config_without_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP02-cors.md").write_text(
+                """---
+work_package_id: WP02
+owned_files:
+- apps/cockpit-api/src/app.ts
+- apps/cockpit-api/src/server.ts
+---
+
+# WP02
+
+Implement production restricted CORS config validation for COCKPIT_CORS_ALLOWED_ORIGINS.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP02")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-runtime-cors-config-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            [
+                "apps/cockpit-api/src/runtime-config.ts",
+                "apps/cockpit-api/tests/cockpit-runtime-entry.test.ts",
+            ],
+        )
+
+    def test_plan_next_blocks_wp_action_when_owned_files_preflight_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport SPEC_KITTY_AGENT="codex"\n',
+                encoding="utf-8",
+            )
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP02-cors.md").write_text(
+                """---
+work_package_id: WP02
+owned_files:
+- apps/cockpit-api/src/app.ts
+---
+
+# WP02
+
+Add production CORS runtime config validation.
+""",
+                encoding="utf-8",
+            )
+            chosen = {
+                "mission": "001-demo",
+                "state": {
+                    "payload": {
+                        "success": True,
+                        "data": {
+                            "summary": {"planned": 1},
+                            "work_packages": [{"wp_id": "WP02", "lane": "planned"}],
+                        },
+                    }
+                },
+            }
+            decision = {
+                "returncode": 0,
+                "payload": {"success": True, "data": {}, "reason": "no next step"},
+                "stderr": "",
+            }
+            with mock.patch.object(spec_backend, "choose_mission", return_value=chosen), mock.patch.object(
+                spec_backend, "next_decision", return_value=decision
+            ), mock.patch.object(spec_backend, "ensure_child_issues", return_value={"status": "planned"}):
+                plan = spec_backend.plan_next(repo)
+
+        self.assertEqual(plan["status"], "blocked")
+        self.assertIsNone(plan["action_command"])
+        self.assertEqual(plan["preflight"]["wp_id"], "WP02")
+
     def test_approved_code_lane_plan_excludes_planning_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

@@ -81,6 +81,7 @@ class PromoteDiscoveryTests(unittest.TestCase):
                         "evidence_hash": "abc123",
                         "finding_count": 0,
                         "findings": [],
+                        "body": "Human: preserve the original structured intake.\n\nTitle: Demo Mission\n",
                         "synthetic_human_intake": True,
                     }
                 ),
@@ -108,10 +109,33 @@ class PromoteDiscoveryTests(unittest.TestCase):
             intake_path = mission_dir / "consensus-rnd" / "intake.md"
             meta = json.loads((mission_dir / "meta.json").read_text(encoding="utf-8"))
             intake_exists = intake_path.exists()
+            intake_body = intake_path.read_text(encoding="utf-8")
 
         self.assertEqual(result["mission_slug"], "demo-mission")
         self.assertTrue(intake_exists)
+        self.assertIn("Human: preserve the original structured intake.", intake_body)
         self.assertEqual(meta["consensus_rnd_spec"]["evidence_hash"], "abc123")
+
+    def test_execute_blocks_specify_from_linked_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            runs = repo / ".consensus-rnd-spec" / "runs"
+            runs.mkdir(parents=True)
+            (repo / ".git").write_text("gitdir: /tmp/common/worktrees/demo\n", encoding="utf-8")
+            artifact = runs / "discovery-20260101T000000Z.json"
+            artifact.write_text(
+                json.dumps({"evidence_hash": "abc123", "finding_count": 0, "findings": []}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(promote_discovery, "run_specify") as run_specify, mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                result = promote_discovery.promote(repo, execute=True)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("project root checkout", result["blocker"]["reason"])
+        run_specify.assert_not_called()
 
     def test_execute_writes_issue_pr_source_metadata_to_mission(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

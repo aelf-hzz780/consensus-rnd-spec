@@ -17,6 +17,8 @@ from spec_backend import evidence_hash, write_discovery_seed
 
 SURFACE_RE = re.compile(r"/(?:codex-refactor-loop|consensus-rnd-spec)\b")
 LOOP_RE = re.compile(r"/loop(?:\s+([^\s/]+))?")
+MARKDOWN_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+TITLE_FIELD_RE = re.compile(r"^\s*Title\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def normalize_text(text: str) -> str:
@@ -25,6 +27,15 @@ def normalize_text(text: str) -> str:
 
 def collapse_ws(text: str) -> str:
     return " ".join(text.split())
+
+
+def trim_structured_text(text: str) -> str:
+    lines = [line.rstrip() for line in text.strip().splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 def extract_markdown_file(instructions: str) -> Path | None:
@@ -43,12 +54,14 @@ def current_branch(repo: Path) -> str:
 
 
 def seed_title(parsed: dict[str, Any]) -> str:
-    prompt_file = parsed.get("prompt_file")
-    if isinstance(prompt_file, dict):
-        title = str(prompt_file.get("title") or "")
-        if "驾驶舱" in title or "cockpit" in title.lower():
-            return "cockpit-readonly-dashboard"
     return title_from_intake(parsed)
+
+
+def first_markdown_h1(content: str) -> str:
+    match = MARKDOWN_H1_RE.search(content)
+    if not match:
+        return ""
+    return collapse_ws(match.group(1).strip())
 
 
 def parse_intake(text: str) -> dict[str, Any]:
@@ -57,7 +70,7 @@ def parse_intake(text: str) -> dict[str, Any]:
     duration = loop_match.group(1) if loop_match and loop_match.group(1) else None
     surfaces = [match.group(0).lstrip("/") for match in SURFACE_RE.finditer(normalized)]
     without_loop = LOOP_RE.sub(" ", normalized, count=1)
-    instructions = collapse_ws(SURFACE_RE.sub(" ", without_loop))
+    instructions = trim_structured_text(SURFACE_RE.sub(" ", without_loop))
     synthetic_human = ""
     if instructions:
         synthetic_human = f"Human: {instructions}"
@@ -73,12 +86,18 @@ def parse_intake(text: str) -> dict[str, Any]:
 def title_from_intake(parsed: dict[str, Any]) -> str:
     prompt_file = parsed.get("prompt_file")
     if isinstance(prompt_file, dict):
+        heading = prompt_file.get("heading")
+        if isinstance(heading, str) and heading.strip():
+            return heading.strip()[:96]
         title = prompt_file.get("title")
         if isinstance(title, str) and title.strip():
             return f"consensus intake: {title.strip()}"[:96]
     instructions = str(parsed.get("instructions") or "").strip()
     if not instructions:
         return "consensus loop intake"
+    explicit_title = TITLE_FIELD_RE.search(instructions)
+    if explicit_title:
+        return collapse_ws(explicit_title.group(1).strip())[:96]
     compact = collapse_ws(instructions)
     if compact.startswith("Human:"):
         compact = compact[len("Human:") :].strip()
@@ -136,6 +155,7 @@ def plan_intake(repo: Path, text: str) -> dict[str, Any]:
         parsed["prompt_file"] = {
             "path": str(prompt_file),
             "title": prompt_file.stem,
+            "heading": first_markdown_h1(content),
             "sha256": evidence_hash(content),
             "content": content,
         }
