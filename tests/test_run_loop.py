@@ -25,6 +25,31 @@ RUN_SPEC.loader.exec_module(run_loop)
 
 
 class RunLoopTests(unittest.TestCase):
+    def test_codex_worker_command_uses_current_unattended_cli_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            prompt = repo / "prompt.md"
+            prompt.write_text("Run the worker.\n", encoding="utf-8")
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+
+            command = run_loop.codex_command(repo, str(prompt), config)
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--ask-for-approval", command)
+
+    def test_worker_workspace_from_prompt_parses_lane_cd_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            lane = repo / ".worktrees" / "mission-lane-a"
+            lane.mkdir(parents=True)
+
+            workspace = run_loop.worker_workspace_from_prompt(
+                repo,
+                f"📍 Workspace: cd {lane}\nLane workspace: lane-a\n",
+            )
+
+        self.assertEqual(workspace, lane)
+
     def test_loop_turn_writes_event_in_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -141,6 +166,8 @@ class RunLoopTests(unittest.TestCase):
     def test_execute_kitty_next_step_runs_prompt_and_records_pending_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
+            mission_dir = repo / "kitty-specs" / "001-demo"
+            (mission_dir / "research").mkdir(parents=True)
             prompt = repo / "kitty-prompt.md"
             prompt.write_text("Implement the Spec Kitty discovery step.\n", encoding="utf-8")
             plan = {
@@ -156,6 +183,10 @@ class RunLoopTests(unittest.TestCase):
                 if command[:2] == ["spec-kitty", "next"]:
                     return {"command": command, "returncode": 0, "stdout_tail": next_stdout, "stderr_tail": ""}
                 if command[:2] == ["codex", "exec"]:
+                    (mission_dir / "research.md").write_text("Research findings.\n", encoding="utf-8")
+                    (mission_dir / "data-model.md").write_text("Data model.\n", encoding="utf-8")
+                    (mission_dir / "research" / "evidence-log.csv").write_text("source,finding\nlocal,ok\n", encoding="utf-8")
+                    (mission_dir / "research" / "source-register.csv").write_text("source,path\nlocal,repo\n", encoding="utf-8")
                     return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
                 raise AssertionError(command)
 
@@ -172,7 +203,98 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(pending["result"], "success")
         self.assertEqual(pending["completed_action"], "research")
 
+    def test_execute_kitty_next_step_does_not_record_success_when_worker_only_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "kitty-specs" / "001-demo").mkdir(parents=True)
+            prompt = repo / "kitty-prompt.md"
+            prompt.write_text("Run research.\n", encoding="utf-8")
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-next-step",
+                "chosen": {"mission": "001-demo"},
+                "advance_command": ["spec-kitty", "next", "--agent", "codex", "--mission", "001-demo", "--json", "--result", "success"],
+            }
+            next_stdout = json.dumps({"mission_slug": "001-demo", "action": "research", "prompt_file": str(prompt)})
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:2] == ["spec-kitty", "next"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": next_stdout, "stderr_tail": ""}
+                if command[:2] == ["codex", "exec"]:
+                    return {"command": command, "returncode": 0, "stdout_tail": "Implementation Plan\nPlease confirm.\n", "stderr_tail": ""}
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run):
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "worker-incomplete")
+        self.assertFalse(result["worker_completed"])
+        self.assertEqual(result["pending_result"]["status"], "not-recorded")
+        self.assertFalse((repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json").exists())
+        self.assertIn("research.md", result["pending_result"]["reason"])
+
     def test_execute_kitty_agent_action_runs_stdout_prompt_and_records_pending_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            lane = repo / ".worktrees" / "demo-lane-a"
+            lane.mkdir(parents=True)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+
+            def fake_run(command: list[str], _repo: Path) -> dict[str, object]:
+                if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
+                    return {
+                        "command": command,
+                        "returncode": 0,
+                        "stdout_tail": f"Workspace: {lane}\nImplement WP01\n",
+                        "stderr_tail": "",
+                    }
+                if command[:2] == ["codex", "exec"]:
+                    self.assertEqual(_repo, lane)
+                    self.assertEqual(command[command.index("--cd") + 1], str(lane))
+                    return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
+                if command[:3] == ["spec-kitty", "orchestrator-api", "mission-state"]:
+                    return {
+                        "command": command,
+                        "returncode": 0,
+                        "stdout_tail": json.dumps({"data": {"work_packages": [{"wp_id": "WP01", "lane": "for_review"}]}}),
+                        "stderr_tail": "",
+                    }
+                raise AssertionError(command)
+
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch(
+                "run_loop.sync_wp_status",
+                side_effect=[
+                    {"status": "synced", "issue": "10", "phase": "crnd:phase:implementing"},
+                    {"status": "synced", "issue": "10", "phase": "crnd:phase:reviewing"},
+                ],
+            ) as sync, mock.patch("run_loop.open_or_update_mission_pr", return_value={"status": "ready", "mission_pr": {"number": "20"}}) as pr_sync:
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+            pending_path = repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json"
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "worker-finished")
+        self.assertEqual(result["execution_kind"], "kitty-agent-action")
+        self.assertEqual(pending["mission_slug"], "001-demo")
+        self.assertEqual(pending["completed_action"], "implement")
+        self.assertEqual(result["worker_workspace"], str(lane))
+        self.assertEqual(sync.call_count, 2)
+        pr_sync.assert_called_once_with(repo, "001-demo", execute=True)
+
+    def test_execute_kitty_agent_action_does_not_record_success_when_worker_only_plans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             plan = {
@@ -189,28 +311,34 @@ class RunLoopTests(unittest.TestCase):
                 if command[:4] == ["spec-kitty", "agent", "action", "implement"]:
                     return {"command": command, "returncode": 0, "stdout_tail": "Implement WP01\n", "stderr_tail": ""}
                 if command[:2] == ["codex", "exec"]:
-                    return {"command": command, "returncode": 0, "stdout_tail": "ok", "stderr_tail": ""}
+                    return {"command": command, "returncode": 0, "stdout_tail": "Implementation Plan\nPlease confirm.\n", "stderr_tail": ""}
+                if command[:3] == ["spec-kitty", "orchestrator-api", "mission-state"]:
+                    return {
+                        "command": command,
+                        "returncode": 0,
+                        "stdout_tail": json.dumps({"data": {"work_packages": [{"wp_id": "WP01", "lane": "in_progress"}]}}),
+                        "stderr_tail": "",
+                    }
                 raise AssertionError(command)
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
             with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch(
                 "run_loop.sync_wp_status",
                 side_effect=[
                     {"status": "synced", "issue": "10", "phase": "crnd:phase:implementing"},
-                    {"status": "synced", "issue": "10", "phase": "crnd:phase:reviewing"},
+                    {"status": "synced", "issue": "10", "phase": "crnd:phase:implementing"},
                 ],
-            ) as sync, mock.patch("run_loop.open_or_update_mission_pr", return_value={"status": "ready", "mission_pr": {"number": "20"}}) as pr_sync:
+            ) as sync, mock.patch("run_loop.open_or_update_mission_pr") as pr_sync:
                 result = run_loop.execute_spec_kitty_action(repo, plan, config)
 
-            pending_path = repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json"
-            pending = json.loads(pending_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(result["status"], "worker-finished")
-        self.assertEqual(result["execution_kind"], "kitty-agent-action")
-        self.assertEqual(pending["mission_slug"], "001-demo")
-        self.assertEqual(pending["completed_action"], "implement")
+        self.assertEqual(result["status"], "worker-incomplete")
+        self.assertFalse(result["worker_completed"])
+        self.assertEqual(result["pending_result"]["status"], "not-recorded")
+        self.assertFalse((repo / ".consensus-rnd-spec" / "state" / "spec-kitty-pending-result.json").exists())
         self.assertEqual(sync.call_count, 2)
-        pr_sync.assert_called_once_with(repo, "001-demo", execute=True)
+        pr_sync.assert_not_called()
 
     def test_execute_kitty_agent_action_blocks_worker_when_github_presync_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -236,6 +364,8 @@ class RunLoopTests(unittest.TestCase):
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
             with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch(
                 "run_loop.sync_wp_status",
                 return_value={"status": "blocked", "reason": "failed to sync WP issue status"},
             ), mock.patch("run_loop.open_or_update_mission_pr") as pr_sync:
@@ -246,6 +376,29 @@ class RunLoopTests(unittest.TestCase):
         self.assertTrue(any(command[:4] == ["spec-kitty", "agent", "action", "implement"] for command in calls))
         self.assertFalse(any(command[:2] == ["codex", "exec"] for command in calls))
         pr_sync.assert_not_called()
+
+    def test_execute_kitty_agent_action_blocks_before_action_when_child_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = {
+                "backend": "spec-kitty",
+                "status": "ready",
+                "execution_kind": "kitty-agent-action",
+                "chosen": {"mission": "001-demo"},
+                "action": "implement",
+                "wp_id": "WP01",
+                "action_command": ["spec-kitty", "agent", "action", "implement", "WP01", "--mission", "001-demo", "--agent", "codex"],
+            }
+            config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
+            with mock.patch("run_loop.ensure_child_issues", return_value={"status": "blocked", "reason": "gh auth failed"}), mock.patch(
+                "run_loop.run_command"
+            ) as run, mock.patch("run_loop.sync_wp_status") as sync:
+                result = run_loop.execute_spec_kitty_action(repo, plan, config)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "GitHub child issue sync failed before Spec Kitty action")
+        run.assert_not_called()
+        sync.assert_not_called()
 
     def test_execute_kitty_agent_action_does_not_sync_github_when_action_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,7 +419,9 @@ class RunLoopTests(unittest.TestCase):
                 raise AssertionError(command)
 
             config = type("Config", (), {"codex_model": "", "codex_extra_args": ""})()
-            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch("run_loop.sync_wp_status") as sync:
+            with mock.patch("run_loop.run_command", side_effect=fake_run), mock.patch(
+                "run_loop.ensure_child_issues", return_value={"status": "ready"}
+            ), mock.patch("run_loop.sync_wp_status") as sync:
                 result = run_loop.execute_spec_kitty_action(repo, plan, config)
 
         self.assertEqual(result["status"], "action-command-only")

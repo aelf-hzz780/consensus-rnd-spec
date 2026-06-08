@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from backend_common import HostConfig, load_config, print_json, utc_now
 
 AUTO_LOOP_SENTINEL = "⟦AI:AUTO-LOOP⟧"
 CONTROLLER_STATUS_MARKER = "🤖 controller status banner"
+CONTROLLER_COMMENTARY_MARKER = "🤖 controller commentary"
 
 MANAGED = "crnd:lifecycle:managed"
 HUMAN_AUTO = "crnd:human:auto"
@@ -54,6 +56,15 @@ LABELS_SOURCE_ANCHOR = "crnd:phase:consensus-reached"
 SENTINEL_SOURCE_ANCHOR = "⟦AI:AUTO-LOOP⟧"
 STATUS_BANNER_SOURCE_ANCHOR = "🤖 controller status banner"
 PR_CLOSES_RE = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
+COMMENTARY_KINDS = (
+    "review",
+    "solver",
+    "meta-judge",
+    "scope",
+    "evidence",
+    "decision",
+    "handoff",
+)
 
 
 @dataclass(frozen=True)
@@ -136,11 +147,44 @@ def load_bindings(mission_path: Path) -> dict[str, Any]:
 
 
 def write_bindings(mission_path: Path, payload: dict[str, Any]) -> Path:
+    normalize_binding_paths(mission_path, payload)
     payload["updated_at"] = utc_now()
     path = bindings_path(mission_path)
     write_json(path, payload)
     update_meta_github_summary(mission_path, payload)
     return path
+
+
+def repo_root_for_mission(mission_path: Path) -> Path:
+    return mission_path.parent.parent
+
+
+def mission_relative_path(mission_path: Path, path: Path) -> str:
+    try:
+        return path.relative_to(repo_root_for_mission(mission_path)).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def normalize_binding_paths(mission_path: Path, payload: dict[str, Any]) -> None:
+    child_issues = payload.get("child_issues")
+    if not isinstance(child_issues, dict):
+        return
+    repo_root = repo_root_for_mission(mission_path)
+    for child in child_issues.values():
+        if not isinstance(child, dict):
+            continue
+        wp_path = child.get("wp_path")
+        if not isinstance(wp_path, str) or not wp_path:
+            continue
+        path = Path(wp_path)
+        if not path.is_absolute():
+            child["wp_path"] = path.as_posix()
+            continue
+        try:
+            child["wp_path"] = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            child["wp_path"] = str(path)
 
 
 def update_meta_github_summary(mission_path: Path, bindings: dict[str, Any]) -> None:
@@ -154,7 +198,7 @@ def update_meta_github_summary(mission_path: Path, bindings: dict[str, Any]) -> 
     if not isinstance(existing, dict):
         existing = {}
     github = {
-        "bindings": str(bindings_path(mission_path)),
+        "bindings": mission_relative_path(mission_path, bindings_path(mission_path)),
         "parent_issue": bindings.get("parent_issue", {}),
         "mission_pr": bindings.get("mission_pr", {}),
         "child_issue_count": len(bindings.get("child_issues", {}) if isinstance(bindings.get("child_issues"), dict) else {}),
@@ -175,11 +219,138 @@ def append_event(bindings: dict[str, Any], event: dict[str, Any]) -> None:
     bindings["events"] = events[-200:]
 
 
+def append_binding_event(mission_path: Path, event: dict[str, Any]) -> Path:
+    """Append an event after reloading bindings to preserve concurrent writers."""
+    bindings = load_bindings(mission_path)
+    append_event(bindings, event)
+    return write_bindings(mission_path, bindings)
+
+
+def record_wp_status_sync(mission_path: Path, wp_id: str, issue: str, phase: str) -> Path:
+    """Record WP status after reloading bindings to preserve concurrent commentary events."""
+    bindings = load_bindings(mission_path)
+    child_issues = bindings.get("child_issues")
+    if not isinstance(child_issues, dict):
+        child_issues = {}
+    child = child_issues.get(wp_id)
+    if not isinstance(child, dict):
+        child = {"number": issue}
+    child["number"] = issue
+    child["phase"] = phase
+    child["last_status_at"] = utc_now()
+    child_issues[wp_id] = child
+    bindings["child_issues"] = child_issues
+    append_event(bindings, {"kind": "wp-status-synced", "wp_id": wp_id, "issue": issue, "phase": phase})
+    return write_bindings(mission_path, bindings)
+
+
+def mark_child_issue_bindings_merged(bindings: dict[str, Any]) -> None:
+    child_issues = bindings.get("child_issues")
+    if not isinstance(child_issues, dict):
+        return
+    now = utc_now()
+    for child in child_issues.values():
+        if not isinstance(child, dict) or not child.get("number"):
+            continue
+        child["phase"] = PHASE_MERGED
+        child["last_status_at"] = now
+
+
+WP_PHASE_LANE_ALLOWLIST: dict[str, set[str]] = {
+    PHASE_DESIGN_SOLVING: {"planned"},
+    PHASE_CONSENSUS_REACHED: {"planned", "approved"},
+    PHASE_IMPLEMENTING: {"claimed", "in_progress"},
+    PHASE_REVIEWING: {"for_review", "in_review"},
+    PHASE_FIXING: {"planned", "claimed", "in_progress"},
+    PHASE_MERGED: {"approved", "done"},
+    PHASE_CLOSED: {"approved", "done", "blocked", "canceled"},
+}
+
+
+def wp_lane_from_status(mission_path: Path, wp_id: str) -> str:
+    status = load_json(mission_path / "status.json")
+    work_packages = status.get("work_packages")
+    if isinstance(work_packages, dict):
+        wp = work_packages.get(wp_id)
+        if isinstance(wp, dict):
+            lane = wp.get("lane")
+            if isinstance(lane, str) and lane.strip():
+                return lane.strip()
+    return ""
+
+
+def validate_wp_phase_against_kitty_lane(mission_path: Path, wp_id: str, phase: str) -> dict[str, Any]:
+    allowed = WP_PHASE_LANE_ALLOWLIST.get(phase)
+    if not allowed:
+        return {"status": "ready", "reason": "phase has no WP lane guard"}
+    lane = wp_lane_from_status(mission_path, wp_id)
+    if not lane:
+        return {"status": "blocked", "reason": "missing Spec Kitty WP lane", "wp_id": wp_id, "phase": phase}
+    if lane not in allowed:
+        return {
+            "status": "blocked",
+            "reason": "GitHub WP phase would lead Spec Kitty lane",
+            "wp_id": wp_id,
+            "phase": phase,
+            "kitty_lane": lane,
+            "allowed_lanes": sorted(allowed),
+        }
+    return {"status": "ready", "wp_id": wp_id, "phase": phase, "kitty_lane": lane, "allowed_lanes": sorted(allowed)}
+
+
+def validate_mission_done_lanes(mission_path: Path, bindings: dict[str, Any]) -> dict[str, Any]:
+    """Require Spec Kitty done transitions before closing issue projections."""
+    status_path = mission_path / "status.json"
+    if not status_path.exists():
+        return {"status": "blocked", "reason": "missing Spec Kitty status.json; refusing to close issues"}
+    status = load_json(status_path)
+    work_packages = status.get("work_packages")
+    if not isinstance(work_packages, dict) or not work_packages:
+        return {"status": "blocked", "reason": "missing Spec Kitty WP status; refusing to close issues"}
+
+    child_issues = bindings.get("child_issues") if isinstance(bindings.get("child_issues"), dict) else {}
+    child_wp_ids = [
+        str(wp_id)
+        for wp_id, child in sorted(child_issues.items())
+        if isinstance(child, dict) and child.get("number")
+    ]
+    wp_ids = child_wp_ids or [str(wp_id) for wp_id in sorted(work_packages)]
+
+    lanes: list[dict[str, str]] = []
+    not_done: list[dict[str, str]] = []
+    for wp_id in wp_ids:
+        wp = work_packages.get(wp_id)
+        lane = ""
+        if isinstance(wp, dict):
+            lane_value = wp.get("lane")
+            if isinstance(lane_value, str):
+                lane = lane_value.strip()
+        entry = {"wp_id": wp_id, "kitty_lane": lane}
+        lanes.append(entry)
+        if lane != "done":
+            not_done.append(entry)
+
+    if not_done:
+        return {
+            "status": "blocked",
+            "reason": "Spec Kitty WPs are not done; refusing to close issues",
+            "required_lane": "done",
+            "not_done": not_done,
+            "lanes": lanes,
+        }
+    return {"status": "ready", "required_lane": "done", "lanes": lanes}
+
+
 def ensure_sentinel(body: str) -> str:
     text = body.rstrip()
     if text.splitlines()[-1:] == [AUTO_LOOP_SENTINEL]:
         return text + "\n"
     return text + "\n\n" + AUTO_LOOP_SENTINEL + "\n"
+
+
+def is_preformatted_commentary(body: str) -> bool:
+    lines = [line.strip() for line in body.strip().splitlines()]
+    return CONTROLLER_COMMENTARY_MARKER in lines and lines[-1:] == [AUTO_LOOP_SENTINEL]
 
 
 def build_status_banner(
@@ -218,6 +389,57 @@ def build_status_banner(
         ]
     )
     return ensure_sentinel(body)
+
+
+def build_commentary_body(
+    *,
+    kind: str,
+    title: str,
+    mission: str,
+    summary: str,
+    details: str = "",
+    wp_id: str = "",
+    issue: str = "",
+    pr: str = "",
+    score: str = "",
+    verdict: str = "",
+    next_step: str = "",
+) -> str:
+    if details.strip() and is_preformatted_commentary(details):
+        return ensure_sentinel(details.strip())
+
+    target = f"{mission} {wp_id}".strip()
+    normalized_kind = normalize_commentary_kind(kind)
+    lines = [
+        f"## 🤖 {normalized_kind}: {title}",
+        "",
+        "### TL;DR",
+        f"- 这是什么: {title}",
+        f"- 现在到哪一步 / 结论是什么: {summary or 'n/a'}",
+        f"- 需要 maintainer 做什么 OR controller 下一步: {next_step or 'controller 继续按 Spec Kitty / consensus-rnd-spec 流程推进。'}",
+        "",
+        "### 结构化记录",
+        "",
+        "| 维度 | 值 |",
+        "|---|---|",
+        f"| 类型 | `{normalized_kind}` |",
+        f"| Mission | `{target}` |",
+        f"| 关联 issue | {('#' + issue) if issue else 'n/a'} |",
+        f"| 关联 PR | {('#' + pr) if pr else 'n/a'} |",
+        f"| 评分 | {score or 'n/a'} |",
+        f"| 结论 | {verdict or 'n/a'} |",
+    ]
+    if details.strip():
+        lines.extend(["", "### 详细说明", "", details.strip()])
+    lines.extend(["", CONTROLLER_COMMENTARY_MARKER])
+    return ensure_sentinel("\n".join(lines))
+
+
+def normalize_commentary_kind(kind: str) -> str:
+    normalized = kind.strip().lower()
+    if normalized not in COMMENTARY_KINDS:
+        raise ValueError(f"unsupported commentary kind: {kind}")
+    return normalized
 
 
 def build_parent_issue_body(mission: str, mission_path: Path, title: str, source: dict[str, Any]) -> str:
@@ -269,7 +491,18 @@ def build_mission_pr_body(mission: str, parent_issue: str, child_issues: dict[st
     for wp_id in sorted(child_issues):
         issue = child_issues.get(wp_id, {}).get("number")
         lines.append(f"- `{wp_id}`: #{issue}" if issue else f"- `{wp_id}`: pending")
-    lines.extend(["", f"Closes #{parent_issue}"])
+    lines.extend(
+        [
+            "",
+            "## Closure Guard",
+            "",
+            "Do not auto-close the parent issue from the PR body. Issue closure is",
+            "controlled by `mark-merged` after it verifies merged PR evidence and",
+            "updates parent/child projection state.",
+            "",
+            f"Related: #{parent_issue}",
+        ]
+    )
     return ensure_sentinel("\n".join(lines))
 
 
@@ -339,11 +572,28 @@ def is_github_sync_enabled(config: HostConfig) -> bool:
     return config.github_sync_enable
 
 
+def transient_gh_error(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in text for marker in (" eof", "timeout", "timed out", "connection reset", "connection refused", "temporary failure"))
+
+
 def run_command(command: list[str], repo: Path) -> CommandResult:
+    attempts = 3 if command and command[0] == "gh" else 1
+    last: subprocess.CompletedProcess[str] | None = None
     try:
-        result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+        for attempt in range(attempts):
+            result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+            last = result
+            if not transient_gh_error(result) or attempt == attempts - 1:
+                break
+            time.sleep(0.5 * (attempt + 1))
     except FileNotFoundError as exc:
         return CommandResult(command=command, returncode=127, stdout="", stderr=str(exc))
+    result = last
+    if result is None:
+        return CommandResult(command=command, returncode=1, stdout="", stderr="command did not run")
     return CommandResult(command=command, returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
 
@@ -361,6 +611,75 @@ def parse_pr_number(text: str) -> str:
         return match.group(1)
     match = re.search(r"\b(\d+)\b", text)
     return match.group(1) if match else ""
+
+
+def pr_view_command(number: str, repo_slug: str) -> list[str]:
+    return ["gh", "pr", "view", str(number), "--repo", repo_slug, "--json", "state,mergedAt,mergeCommit,url,headRefName,baseRefName"]
+
+
+def validate_mission_pr_merge_evidence(
+    repo: Path,
+    config: HostConfig,
+    bindings: dict[str, Any],
+    repo_slug: str,
+    *,
+    execute: bool,
+    merged_pr: str = "",
+) -> dict[str, Any]:
+    mission_pr = bindings.get("mission_pr") if isinstance(bindings.get("mission_pr"), dict) else {}
+    number = str(merged_pr or mission_pr.get("number") or "")
+    if not number:
+        return {"status": "blocked", "reason": "missing mission PR binding; refusing to close issues without merged PR evidence"}
+    command = pr_view_command(number, repo_slug)
+    if not execute:
+        planned_pr = dict(mission_pr)
+        if merged_pr:
+            planned_pr["number"] = str(merged_pr)
+            planned_pr["binding_source"] = "verified-merged-pr-override"
+        return {"status": "ready", "mission_pr": planned_pr, "merge_evidence_command": command}
+    result = run_command(command, config.repo_root)
+    if result.returncode != 0:
+        return {"status": "blocked", "reason": "failed to read mission PR merge evidence", "mission_pr": mission_pr, "result": result.as_dict()}
+    try:
+        payload = json.loads(result.stdout) if result.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {"status": "blocked", "reason": "invalid mission PR merge evidence JSON", "mission_pr": mission_pr, "result": result.as_dict()}
+    state = str(payload.get("state") or "")
+    merged_at = str(payload.get("mergedAt") or "")
+    merge_commit = payload.get("mergeCommit")
+    has_merge_commit = isinstance(merge_commit, dict) and bool(merge_commit.get("oid"))
+    if state != "MERGED" or not merged_at or not has_merge_commit:
+        return {
+            "status": "blocked",
+            "reason": "mission PR is not merged; refusing to close issues",
+            "mission_pr": mission_pr,
+            "state": state,
+            "merged_at": merged_at,
+            "has_merge_commit": has_merge_commit,
+            "result": result.as_dict(),
+        }
+    verified_pr = dict(mission_pr)
+    verified_pr["number"] = number
+    if payload.get("url"):
+        verified_pr["url"] = str(payload.get("url"))
+    if payload.get("headRefName"):
+        verified_pr["head"] = str(payload.get("headRefName"))
+    if payload.get("baseRefName"):
+        verified_pr["base"] = str(payload.get("baseRefName"))
+    if merged_pr:
+        verified_pr["binding_source"] = "verified-merged-pr-override"
+    verified_pr["merged_at"] = merged_at
+    verified_pr["merge_commit"] = str(merge_commit.get("oid"))
+    evidence = {
+        "state": state,
+        "merged_at": merged_at,
+        "merge_commit": str(merge_commit.get("oid")),
+        "url": str(payload.get("url") or ""),
+        "head": str(payload.get("headRefName") or ""),
+        "base": str(payload.get("baseRefName") or ""),
+        "result": result.as_dict(),
+    }
+    return {"status": "ready", "mission_pr": verified_pr, "merge_evidence": evidence}
 
 
 def resolve_repo_slug(repo: Path, config: HostConfig, *, execute: bool) -> dict[str, Any]:
@@ -481,12 +800,43 @@ def existing_source_issue(source: dict[str, Any]) -> str:
     return str(value) if value else ""
 
 
+def is_issue_bound_as_child(repo: Path, issue_number: str) -> bool:
+    if not issue_number:
+        return False
+    specs_dir = repo / "kitty-specs"
+    if not specs_dir.is_dir():
+        return False
+    for path in specs_dir.glob("*/consensus-rnd/github-bindings.json"):
+        bindings = load_json(path)
+        children = bindings.get("child_issues") if isinstance(bindings, dict) else None
+        if not isinstance(children, dict):
+            continue
+        for child in children.values():
+            if isinstance(child, dict) and str(child.get("number") or "") == issue_number:
+                return True
+    return False
+
+
 def write_body_file(mission_path: Path, name: str, body: str) -> Path:
     out_dir = mission_path / "consensus-rnd" / "github"
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / name
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def safe_file_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+    return stem[:80] or "commentary"
+
+
+def read_optional_details(config: HostConfig, details_file: str = "", detail: str = "") -> str:
+    if details_file:
+        path = Path(details_file).expanduser()
+        if not path.is_absolute():
+            path = config.repo_root / path
+        return path.read_text(encoding="utf-8")
+    return detail
 
 
 def ensure_parent_issue(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
@@ -501,6 +851,8 @@ def ensure_parent_issue(repo: Path, mission: str, *, execute: bool = False) -> d
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     source = mission_source(path)
     source_issue = existing_source_issue(source)
+    if source_issue and is_issue_bound_as_child(config.repo_root, source_issue):
+        source_issue = ""
     title = mission_title(mission, source)
     if source_issue:
         parent = {"number": source_issue, "source": "source_issue", "title": title}
@@ -546,8 +898,46 @@ def wp_files(mission_path: Path) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     for path in sorted(tasks.glob("WP*.md")):
         wp_id = path.name.split("-", 1)[0]
-        items.append({"wp_id": wp_id, "path": str(path), "title": path.stem})
+        items.append(
+            {
+                "wp_id": wp_id,
+                "path": mission_relative_path(mission_path, path),
+                "title": wp_prompt_title(path, wp_id),
+            }
+        )
     return items
+
+
+def wp_prompt_title(path: Path, wp_id: str) -> str:
+    fallback = path.stem.split("-", 1)[1].replace("-", " ") if "-" in path.stem else path.stem
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    if not text.startswith("---"):
+        return fallback
+    for line in text.splitlines()[1:80]:
+        if line.strip() == "---":
+            break
+        match = re.match(r"\s*title:\s*(.+?)\s*$", line)
+        if match:
+            value = match.group(1).strip().strip('"').strip("'")
+            return value or fallback
+    return fallback
+
+
+def child_issue_title(mission: str, wp: dict[str, str]) -> str:
+    wp_id = wp["wp_id"]
+    readable = wp.get("title") or wp_id
+    prefix = f"{wp_id}: {readable}"
+    suffix = f" ({mission})"
+    max_len = 96
+    if len(prefix) + len(suffix) <= max_len:
+        return prefix + suffix
+    remaining = max_len - len(prefix) - 4
+    if remaining <= 12:
+        return prefix[:max_len]
+    return f"{prefix} ({mission[:remaining]}...)"
 
 
 def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
@@ -579,7 +969,7 @@ def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> d
             continue
         body = build_child_issue_body(mission, wp, str(parent_issue), str(bindings.get("mission_pr", {}).get("number") or ""))
         body_file = write_body_file(path, f"{wp_id}-issue.md", body)
-        title = f"{mission} {wp_id}: {wp['title']}"[:96]
+        title = child_issue_title(mission, wp)
         command = [
             "gh",
             "issue",
@@ -628,6 +1018,9 @@ def ensure_child_issues(repo: Path, mission: str, *, execute: bool = False) -> d
 def sync_wp_status(repo: Path, mission: str, wp_id: str, phase: str, *, detail: str = "", execute: bool = False) -> dict[str, Any]:
     config = load_config(repo)
     path = mission_dir(config.repo_root, mission)
+    lane_guard = validate_wp_phase_against_kitty_lane(path, wp_id, phase)
+    if lane_guard.get("status") == "blocked":
+        return lane_guard
     bindings = load_bindings(path)
     child = bindings.get("child_issues", {}).get(wp_id) if isinstance(bindings.get("child_issues"), dict) else None
     if not isinstance(child, dict) or not child.get("number"):
@@ -659,35 +1052,151 @@ def sync_wp_status(repo: Path, mission: str, wp_id: str, phase: str, *, detail: 
     results = [run_command(command, config.repo_root).as_dict() for command in commands]
     if any(result["returncode"] != 0 for result in results):
         return {"status": "blocked", "reason": "failed to sync WP issue status", "results": results}
-    child["phase"] = phase
-    child["last_status_at"] = utc_now()
-    append_event(bindings, {"kind": "wp-status-synced", "wp_id": wp_id, "issue": number, "phase": phase})
-    out = write_bindings(path, bindings)
+    out = record_wp_status_sync(path, wp_id, number, phase)
     return {"status": "synced", "issue": number, "phase": phase, "results": results, "bindings_path": str(out)}
 
 
+def commentary_issue_number(bindings: dict[str, Any], *, issue: str = "", wp_id: str = "") -> str:
+    if issue:
+        return issue
+    if wp_id:
+        child = bindings.get("child_issues", {}).get(wp_id) if isinstance(bindings.get("child_issues"), dict) else None
+        if isinstance(child, dict) and child.get("number"):
+            return str(child["number"])
+        return ""
+    parent = bindings.get("parent_issue") if isinstance(bindings.get("parent_issue"), dict) else None
+    return str(parent.get("number") or "") if isinstance(parent, dict) else ""
+
+
+def post_commentary(
+    repo: Path,
+    mission: str,
+    *,
+    kind: str,
+    title: str,
+    summary: str,
+    detail: str = "",
+    details_file: str = "",
+    issue: str = "",
+    wp_id: str = "",
+    score: str = "",
+    verdict: str = "",
+    next_step: str = "",
+    execute: bool = False,
+) -> dict[str, Any]:
+    config = load_config(repo)
+    path = mission_dir(config.repo_root, mission)
+    bindings = load_bindings(path)
+    try:
+        normalized_kind = normalize_commentary_kind(kind)
+        details = read_optional_details(config, details_file=details_file, detail=detail)
+    except (OSError, ValueError) as exc:
+        return {"status": "blocked", "reason": str(exc)}
+    number = commentary_issue_number(bindings, issue=issue, wp_id=wp_id)
+    if not number:
+        return {"status": "blocked", "reason": "missing target issue binding"}
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
+    if preflight.get("status") in {"disabled", "blocked"}:
+        return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
+    repo_slug = planned_repo_slug(preflight, config)
+    body = build_commentary_body(
+        kind=normalized_kind,
+        title=title,
+        mission=mission,
+        summary=summary,
+        details=details,
+        wp_id=wp_id,
+        issue=number,
+        pr=str(bindings.get("mission_pr", {}).get("number") or ""),
+        score=score,
+        verdict=verdict,
+        next_step=next_step,
+    )
+    stem = safe_file_stem("-".join(part for part in (wp_id, normalized_kind, title) if part))
+    body_file = write_body_file(path, f"{stem}.md", body)
+    command = issue_comment_command(number, repo_slug, body_file)
+    if not execute:
+        return {"status": "planned", "command": command, "body_file": str(body_file), "preflight": preflight}
+    result = run_command(command, config.repo_root)
+    if result.returncode != 0:
+        return {"status": "blocked", "reason": "failed to post commentary", "result": result.as_dict()}
+    out = append_binding_event(
+        path,
+        {
+            "kind": "commentary-posted",
+            "commentary_kind": normalized_kind,
+            "issue": number,
+            "wp_id": wp_id,
+            "title": title,
+        },
+    )
+    return {
+        "status": "posted",
+        "issue": number,
+        "commentary_kind": normalized_kind,
+        "body_file": str(body_file),
+        "result": result.as_dict(),
+        "bindings_path": str(out),
+    }
+
+
+FINAL_BRANCH_PATTERNS = (
+    re.compile(r"(?im)^\s*-\s*(?:Final merge target|Planning/base branch)\s*:\s*`([^`]+)`"),
+    re.compile(r"(?im)^\s*-\s*GitHub mission PR base and final landing branch\s*:\s*`([^`]+)`"),
+    re.compile(r"(?im)^\s*-\s*Base branch\s*:\s*`([^`]+)`"),
+)
+
+
+def final_landing_branch_for_mission(mission_path: Path) -> str:
+    for relative in ("plan.md", "spec.md", "consensus-rnd/intake.md"):
+        path = mission_path / relative
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for pattern in FINAL_BRANCH_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
 def target_branch_for_mission(mission_path: Path) -> str:
+    final_branch = final_landing_branch_for_mission(mission_path)
+    if final_branch:
+        return final_branch
     meta = load_json(mission_path / "meta.json")
     value = meta.get("target_branch")
     return str(value) if value else "main"
 
 
-def candidate_mission_branches(repo: Path, mission: str) -> list[str]:
+def is_spec_kitty_lane_branch(branch: str) -> bool:
+    return "-lane-" in branch
+
+
+def meta_target_branch_for_mission(mission_path: Path) -> str:
+    meta = load_json(mission_path / "meta.json")
+    value = meta.get("target_branch")
+    return str(value).strip() if value else ""
+
+
+def candidate_mission_branches(repo: Path, mission: str, mission_path: Path | None = None) -> list[str]:
     branches = [
+        meta_target_branch_for_mission(mission_path) if mission_path else "",
         f"kitty/{mission}",
         f"kitty/mission-{mission}",
         f"codex/{mission}",
+        f"codex/mission-{mission}",
         mission,
     ]
-    workspaces = repo / ".kittify" / "workspaces"
-    if workspaces.is_dir():
-        for path in sorted(workspaces.glob(f"*{mission}*.json")):
-            data = load_json(path)
-            for key in ("branch", "branch_name", "head", "head_ref"):
-                value = data.get(key)
-                if isinstance(value, str) and value:
-                    branches.insert(0, value)
-    return list(dict.fromkeys(branches))
+    return [branch for branch in dict.fromkeys(branches) if not is_spec_kitty_lane_branch(branch)]
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    result = subprocess.run(["git", "rev-parse", "--verify", "--quiet", branch], cwd=repo, capture_output=True, text=True, check=False)
+    return result.returncode == 0
 
 
 def branch_has_commits(repo: Path, branch: str, base: str) -> bool:
@@ -700,16 +1209,65 @@ def branch_has_commits(repo: Path, branch: str, base: str) -> bool:
         return False
 
 
-def resolve_mission_branch(repo: Path, mission: str, base: str) -> str:
-    for branch in candidate_mission_branches(repo, mission):
-        if branch_has_commits(repo, branch, base):
+def github_base_validation_ref(repo: Path, base: str) -> str:
+    """Use the remote-tracking PR base when available.
+
+    A controller workspace may have a local ``feature/*`` branch advanced to
+    the candidate head while GitHub's PR base is still ``origin/feature/*``.
+    Validate PR head commits against the remote-tracking base to match GitHub's
+    comparison semantics.
+    """
+    origin_base = f"origin/{base}"
+    return origin_base if branch_exists(repo, origin_base) else base
+
+
+def branch_or_origin_ref_has_commits(repo: Path, branch: str, base: str) -> bool:
+    """Return True when a local branch or its origin tracking ref has commits.
+
+    GitHub PR heads are often remote-only from the controller workspace after a
+    push. Keep the public GitHub head as ``branch`` while using
+    ``origin/<branch>`` only for local git validation.
+    """
+    validation_base = github_base_validation_ref(repo, base)
+    if branch_exists(repo, branch) and branch_has_commits(repo, branch, validation_base):
+        return True
+    origin_branch = f"origin/{branch}"
+    return branch_exists(repo, origin_branch) and branch_has_commits(repo, origin_branch, validation_base)
+
+
+def resolve_mission_branch(repo: Path, mission: str, base: str, *, explicit_head: str = "", mission_path: Path | None = None) -> str:
+    if explicit_head:
+        if is_spec_kitty_lane_branch(explicit_head):
+            return ""
+        return explicit_head if branch_or_origin_ref_has_commits(repo, explicit_head, base) else ""
+    for branch in candidate_mission_branches(repo, mission, mission_path=mission_path):
+        if branch_or_origin_ref_has_commits(repo, branch, base):
             return branch
     return ""
 
 
-def open_or_update_mission_pr(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
+def open_or_update_mission_pr(repo: Path, mission: str, *, head_override: str = "", execute: bool = False) -> dict[str, Any]:
     config = load_config(repo)
     path = mission_dir(config.repo_root, mission)
+    base = target_branch_for_mission(path)
+    if head_override and is_spec_kitty_lane_branch(head_override):
+        return {
+            "status": "blocked",
+            "reason": "mission PR head must be a mission branch, not a WP lane branch",
+            "base": base,
+            "head_override": head_override,
+        }
+    head = resolve_mission_branch(config.repo_root, mission, base, explicit_head=head_override, mission_path=path)
+    if not head:
+        reason = "explicit head branch does not exist or has no commits" if head_override else "mission branch has no commits or cannot be resolved"
+        return {"status": "blocked", "reason": reason, "base": base, "head_override": head_override}
+    if head == base:
+        return {
+            "status": "blocked",
+            "reason": "mission PR head must differ from base",
+            "base": base,
+            "head": head,
+        }
     bindings = load_bindings(path)
     parent = ensure_parent_issue(config.repo_root, mission, execute=execute)
     if parent.get("status") in {"disabled", "blocked"}:
@@ -721,10 +1279,6 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, execute: bool = False
     if child_sync.get("status") in {"disabled", "blocked"}:
         return {"status": child_sync["status"], "reason": child_sync.get("reason"), "parent": parent, "child_sync": child_sync}
     bindings = load_bindings(path)
-    base = target_branch_for_mission(path)
-    head = resolve_mission_branch(config.repo_root, mission, base)
-    if not head:
-        return {"status": "blocked", "reason": "mission branch has no commits or cannot be resolved", "base": base}
     preflight = github_write_preflight(config.repo_root, config, execute=execute)
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
@@ -796,7 +1350,7 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, execute: bool = False
     return {"status": "ready", "mission_pr": bindings["mission_pr"], "results": results, "bindings_path": str(out)}
 
 
-def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
+def mark_mission_merged(repo: Path, mission: str, *, merged_pr: str = "", skip_parent: bool = False, execute: bool = False) -> dict[str, Any]:
     config = load_config(repo)
     path = mission_dir(config.repo_root, mission)
     bindings = load_bindings(path)
@@ -804,22 +1358,81 @@ def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> d
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     repo_slug = planned_repo_slug(preflight, config)
+    lane_guard = validate_mission_done_lanes(path, bindings)
+    if lane_guard.get("status") == "blocked":
+        return {"status": "blocked", "reason": lane_guard.get("reason"), "preflight": preflight, "lane_guard": lane_guard}
+    evidence = validate_mission_pr_merge_evidence(config.repo_root, config, bindings, repo_slug, execute=execute, merged_pr=merged_pr)
+    if evidence.get("status") in {"disabled", "blocked"}:
+        return {
+            "status": evidence["status"],
+            "reason": evidence.get("reason"),
+            "preflight": preflight,
+            "lane_guard": lane_guard,
+            "merge_evidence": evidence,
+        }
     commands: list[list[str]] = []
     parent_issue = str(bindings.get("parent_issue", {}).get("number") or "")
-    if parent_issue:
+    if parent_issue and not skip_parent:
         commands.append(label_edit_command("issue", parent_issue, repo_slug, PHASE_MERGED))
+        commands.append(["gh", "issue", "close", parent_issue, "--repo", repo_slug])
+    evidence_pr = evidence.get("mission_pr") if isinstance(evidence.get("mission_pr"), dict) else {}
+    mission_pr = str(evidence_pr.get("number") or bindings.get("mission_pr", {}).get("number") or "")
+    if mission_pr:
+        commands.append(label_edit_command("pr", mission_pr, repo_slug, PHASE_MERGED))
     for child in (bindings.get("child_issues") or {}).values():
         if isinstance(child, dict) and child.get("number"):
             commands.append(label_edit_command("issue", str(child["number"]), repo_slug, PHASE_MERGED))
             commands.append(["gh", "issue", "close", str(child["number"]), "--repo", repo_slug])
     if not execute:
-        return {"status": "planned", "commands": commands}
+        return {"status": "planned", "commands": commands, "lane_guard": lane_guard, "merge_evidence": evidence}
     results = [run_command(command, config.repo_root).as_dict() for command in commands]
     if any(result["returncode"] != 0 for result in results):
         return {"status": "blocked", "reason": "failed to mark mission merged", "results": results}
-    append_event(bindings, {"kind": "mission-merged"})
+    if evidence_pr:
+        bindings["mission_pr"] = evidence_pr
+    mark_child_issue_bindings_merged(bindings)
+    append_event(
+        bindings,
+        {
+            "kind": "mission-merged",
+            "merge_evidence": evidence.get("merge_evidence", {}),
+            "merged_pr_override": str(merged_pr or ""),
+            "parent_skipped": bool(skip_parent),
+        },
+    )
     out = write_bindings(path, bindings)
-    return {"status": "synced", "results": results, "bindings_path": str(out)}
+    return {"status": "synced", "results": results, "bindings_path": str(out), "lane_guard": lane_guard, "merge_evidence": evidence}
+
+
+def bind_merged_pr(repo: Path, mission: str, *, merged_pr: str, execute: bool = False) -> dict[str, Any]:
+    """Bind a verified merged PR without closing issues or changing phase labels."""
+    config = load_config(repo)
+    path = mission_dir(config.repo_root, mission)
+    bindings = load_bindings(path)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
+    if preflight.get("status") in {"disabled", "blocked"}:
+        return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
+    if not str(merged_pr or "").strip():
+        return {"status": "blocked", "reason": "--merged-pr is required for bind-merged-pr", "preflight": preflight}
+    repo_slug = planned_repo_slug(preflight, config)
+    evidence = validate_mission_pr_merge_evidence(config.repo_root, config, bindings, repo_slug, execute=execute, merged_pr=merged_pr)
+    if evidence.get("status") in {"disabled", "blocked"}:
+        return {"status": evidence["status"], "reason": evidence.get("reason"), "preflight": preflight, "merge_evidence": evidence}
+    evidence_pr = evidence.get("mission_pr") if isinstance(evidence.get("mission_pr"), dict) else {}
+    if not execute:
+        return {"status": "planned", "preflight": preflight, "mission_pr": evidence_pr, "merge_evidence": evidence}
+    bindings["mission_pr"] = evidence_pr
+    append_event(
+        bindings,
+        {
+            "kind": "merged-pr-bound",
+            "merge_evidence": evidence.get("merge_evidence", {}),
+            "merged_pr_override": str(merged_pr or ""),
+            "issues_closed": False,
+        },
+    )
+    out = write_bindings(path, bindings)
+    return {"status": "synced", "bindings_path": str(out), "mission_pr": evidence_pr, "merge_evidence": evidence}
 
 
 def source_contract() -> dict[str, Any]:
@@ -827,10 +1440,16 @@ def source_contract() -> dict[str, Any]:
         "labels_source_anchor": LABELS_SOURCE_ANCHOR,
         "sentinel_source_anchor": SENTINEL_SOURCE_ANCHOR,
         "status_banner_source_anchor": STATUS_BANNER_SOURCE_ANCHOR,
+        "commentary_source_anchor": CONTROLLER_COMMENTARY_MARKER,
+        "commentary_kinds": list(COMMENTARY_KINDS),
         "managed_label": MANAGED,
         "phase_labels": list(PHASE_LABELS),
         "human_labels": list(HUMAN_LABELS),
     }
+
+
+def exit_code_for_result(result: dict[str, Any]) -> int:
+    return 1 if result.get("status") in {"blocked", "failed", "error"} else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -851,26 +1470,73 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--phase", required=True)
     status.add_argument("--detail", default="")
     status.add_argument("--execute", action="store_true")
+    commentary = sub.add_parser("post-commentary")
+    commentary.add_argument("--repo", default=".")
+    commentary.add_argument("--mission", required=True)
+    commentary.add_argument("--kind", required=True, choices=COMMENTARY_KINDS)
+    commentary.add_argument("--title", required=True)
+    commentary.add_argument("--summary", required=True)
+    commentary.add_argument("--detail", default="")
+    commentary.add_argument("--details-file", default="")
+    commentary.add_argument("--issue", default="")
+    commentary.add_argument("--wp-id", default="")
+    commentary.add_argument("--score", default="")
+    commentary.add_argument("--verdict", default="")
+    commentary.add_argument("--next-step", default="")
+    commentary.add_argument("--execute", action="store_true")
     pr = sub.add_parser("open-pr")
     pr.add_argument("--repo", default=".")
     pr.add_argument("--mission", required=True)
+    pr.add_argument("--head", default="")
     pr.add_argument("--execute", action="store_true")
+    bind_pr = sub.add_parser("bind-merged-pr")
+    bind_pr.add_argument("--repo", default=".")
+    bind_pr.add_argument("--mission", required=True)
+    bind_pr.add_argument("--merged-pr", required=True, help="Verified merged PR number to bind without closing issues.")
+    bind_pr.add_argument("--execute", action="store_true")
+    merged = sub.add_parser("mark-merged")
+    merged.add_argument("--repo", default=".")
+    merged.add_argument("--mission", required=True)
+    merged.add_argument("--merged-pr", default="", help="Verified merged PR number to bind before closing legacy/catch-up mission projection.")
+    merged.add_argument("--skip-parent", action="store_true", help="Do not close the parent issue; useful when a source issue is reused by later missions.")
+    merged.add_argument("--execute", action="store_true")
     contract = sub.add_parser("contract")
     contract.add_argument("--repo", default=".")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
     if args.command == "ensure-parent":
-        print_json(ensure_parent_issue(repo, args.mission, execute=args.execute))
+        result = ensure_parent_issue(repo, args.mission, execute=args.execute)
     elif args.command == "ensure-children":
-        print_json(ensure_child_issues(repo, args.mission, execute=args.execute))
+        result = ensure_child_issues(repo, args.mission, execute=args.execute)
     elif args.command == "sync-wp-status":
-        print_json(sync_wp_status(repo, args.mission, args.wp_id, args.phase, detail=args.detail, execute=args.execute))
+        result = sync_wp_status(repo, args.mission, args.wp_id, args.phase, detail=args.detail, execute=args.execute)
+    elif args.command == "post-commentary":
+        result = post_commentary(
+            repo,
+            args.mission,
+            kind=args.kind,
+            title=args.title,
+            summary=args.summary,
+            detail=args.detail,
+            details_file=args.details_file,
+            issue=args.issue,
+            wp_id=args.wp_id,
+            score=args.score,
+            verdict=args.verdict,
+            next_step=args.next_step,
+            execute=args.execute,
+        )
     elif args.command == "open-pr":
-        print_json(open_or_update_mission_pr(repo, args.mission, execute=args.execute))
+        result = open_or_update_mission_pr(repo, args.mission, head_override=args.head, execute=args.execute)
+    elif args.command == "bind-merged-pr":
+        result = bind_merged_pr(repo, args.mission, merged_pr=args.merged_pr, execute=args.execute)
+    elif args.command == "mark-merged":
+        result = mark_mission_merged(repo, args.mission, merged_pr=args.merged_pr, skip_parent=args.skip_parent, execute=args.execute)
     else:
-        print_json(source_contract())
-    return 0
+        result = source_contract()
+    print_json(result)
+    return exit_code_for_result(result)
 
 
 if __name__ == "__main__":

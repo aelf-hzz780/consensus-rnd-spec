@@ -214,6 +214,52 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["action"], "review")
         self.assertEqual(plan["action_command"], ["spec-kitty", "agent", "action", "review", "WP02", "--mission", "001-demo", "--agent", "codex"])
 
+    def test_wp_action_from_chosen_resumes_in_progress_before_planned_dependency(self) -> None:
+        chosen = {
+            "mission": "001-demo",
+            "state": {
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "work_packages": [
+                            {"wp_id": "WP01", "lane": "in_progress", "dependencies": []},
+                            {"wp_id": "WP02", "lane": "planned", "dependencies": ["WP01"]},
+                        ]
+                    },
+                }
+            },
+        }
+
+        plan = spec_backend.wp_action_from_chosen(chosen, "001-demo", "codex")
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["action"], "implement")
+        self.assertEqual(plan["wp_id"], "WP01")
+
+    def test_wp_action_from_chosen_skips_planned_wp_with_unmet_dependencies(self) -> None:
+        chosen = {
+            "mission": "001-demo",
+            "state": {
+                "payload": {
+                    "success": True,
+                    "data": {
+                        "work_packages": [
+                            {"wp_id": "WP01", "lane": "in_progress", "dependencies": []},
+                            {"wp_id": "WP02", "lane": "planned", "dependencies": ["WP01"]},
+                        ]
+                    },
+                }
+            },
+        }
+
+        packages = spec_backend.state_work_packages(chosen["state"])
+        lanes = spec_backend.state_lane_items(chosen["state"])
+        packages = [package for package in packages if package["lane"] == "planned"]
+        target = spec_backend.first_actionable_wp(packages, lanes)
+
+        self.assertIsNone(target)
+
     def test_plan_next_adds_github_child_issue_plan_for_wp_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -247,6 +293,266 @@ class SpecBackendTests(unittest.TestCase):
         self.assertEqual(plan["execution_kind"], "kitty-agent-action")
         self.assertEqual(plan["github_sync"]["status"], "planned")
         ensure.assert_called_once_with(repo.resolve(), "001-demo", execute=False)
+
+    def test_audit_wp_owned_files_blocks_runtime_cors_config_without_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP02-cors.md").write_text(
+                """---
+work_package_id: WP02
+owned_files:
+- apps/cockpit-api/src/app.ts
+- apps/cockpit-api/src/server.ts
+---
+
+# WP02
+
+Implement production restricted CORS config validation for COCKPIT_CORS_ALLOWED_ORIGINS.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP02")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-runtime-cors-config-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            [
+                "apps/cockpit-api/src/runtime-config.ts",
+                "apps/cockpit-api/tests/cockpit-runtime-entry.test.ts",
+            ],
+        )
+
+    def test_audit_wp_owned_files_blocks_api_contract_tests_without_api_test_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP03-sort.md").write_text(
+                """---
+work_package_id: WP03
+owned_files:
+- apps/cockpit-api/src/dto.ts
+- apps/cockpit-api/src/validation.ts
+---
+
+# WP03
+
+Update API DTO parsing for the sort query parameter and add application/API contract tests.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP03")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-api-contract-test-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            ["apps/cockpit-api/tests/cockpit-api.test.ts"],
+        )
+
+    def test_audit_wp_owned_files_blocks_durable_query_proof_without_postgres_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP04-release-gate.md").write_text(
+                """---
+work_package_id: WP04
+owned_files:
+- scripts/schema-validate.mjs
+- tests/gates/release-gate-scripts.test.ts
+---
+
+# WP04
+
+Upgrade the Cockpit semantic release gate and durability proof so PostgreSQL
+durable SQL cannot remain offset-only when the shared keyset contract exists.
+""",
+                encoding="utf-8",
+            )
+
+            audit = spec_backend.audit_wp_owned_files(repo, "001-demo", "WP04")
+
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(audit["checks"][0]["rule"], "cockpit-durable-query-proof-ownership")
+        self.assertEqual(
+            audit["checks"][0]["missing_owned_files"],
+            [
+                "packages/cockpit-infrastructure/src/postgres.ts",
+                "packages/cockpit-infrastructure/tests/cockpit-postgres-storage.test.ts",
+            ],
+        )
+
+    def test_plan_next_blocks_wp_action_when_owned_files_preflight_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport SPEC_KITTY_AGENT="codex"\n',
+                encoding="utf-8",
+            )
+            tasks = repo / "kitty-specs" / "001-demo" / "tasks"
+            tasks.mkdir(parents=True)
+            (tasks / "WP02-cors.md").write_text(
+                """---
+work_package_id: WP02
+owned_files:
+- apps/cockpit-api/src/app.ts
+---
+
+# WP02
+
+Add production CORS runtime config validation.
+""",
+                encoding="utf-8",
+            )
+            chosen = {
+                "mission": "001-demo",
+                "state": {
+                    "payload": {
+                        "success": True,
+                        "data": {
+                            "summary": {"planned": 1},
+                            "work_packages": [{"wp_id": "WP02", "lane": "planned"}],
+                        },
+                    }
+                },
+            }
+            decision = {
+                "returncode": 0,
+                "payload": {"success": True, "data": {}, "reason": "no next step"},
+                "stderr": "",
+            }
+            with mock.patch.object(spec_backend, "choose_mission", return_value=chosen), mock.patch.object(
+                spec_backend, "next_decision", return_value=decision
+            ), mock.patch.object(spec_backend, "ensure_child_issues", return_value={"status": "planned"}):
+                plan = spec_backend.plan_next(repo)
+
+        self.assertEqual(plan["status"], "blocked")
+        self.assertIsNone(plan["action_command"])
+        self.assertEqual(plan["preflight"]["wp_id"], "WP02")
+
+    def test_approved_code_lane_plan_excludes_planning_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                """
+{
+  "mission_slug": "001-demo",
+  "mission_branch": "kitty/mission-001-demo",
+  "target_branch": "feature/demo",
+  "lanes": [
+    {"lane_id": "lane-a", "wp_ids": ["WP01"]},
+    {"lane_id": "lane-planning", "wp_ids": ["WP02"]}
+  ]
+}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text(
+                '{"wp_id":"WP01","to_lane":"approved"}\n{"wp_id":"WP02","to_lane":"approved"}\n',
+                encoding="utf-8",
+            )
+
+            plan = spec_backend.approved_code_lane_plan(repo, "001-demo")
+
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual([lane["lane_id"] for lane in plan["lanes"]], ["lane-a"])
+        self.assertEqual(plan["blockers"][0]["lane_id"], "lane-planning")
+
+    def test_approved_code_lane_plan_blocks_unapproved_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01","WP02"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text(
+                '{"wp_id":"WP01","to_lane":"approved"}\n{"wp_id":"WP02","to_lane":"in_progress"}\n',
+                encoding="utf-8",
+            )
+
+            plan = spec_backend.approved_code_lane_plan(repo, "001-demo")
+
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["blockers"][0]["missing"], ["WP02"])
+        self.assertEqual(plan["blockers"][0]["lanes"]["WP02"], "in_progress")
+
+    def test_integrate_approved_lanes_dry_run_does_not_call_merge_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text('{"wp_id":"WP01","to_lane":"approved"}\n', encoding="utf-8")
+            with mock.patch.object(spec_backend.subprocess, "run") as run:
+                result = spec_backend.integrate_approved_lanes(repo, "001-demo", execute=False)
+
+        self.assertEqual(result["status"], "planned")
+        run.assert_not_called()
+
+    def test_integrate_approved_lanes_blocks_dirty_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission = repo / "kitty-specs" / "001-demo"
+            mission.mkdir(parents=True)
+            (mission / "meta.json").write_text('{"slug":"001-demo","target_branch":"feature/demo"}\n', encoding="utf-8")
+            (mission / "lanes.json").write_text(
+                '{"mission_branch":"kitty/mission-001-demo","target_branch":"feature/demo","lanes":[{"lane_id":"lane-a","wp_ids":["WP01"]}]}\n',
+                encoding="utf-8",
+            )
+            (mission / "status.events.jsonl").write_text('{"wp_id":"WP01","to_lane":"approved"}\n', encoding="utf-8")
+
+            def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                if command == ["git", "status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M src/app.ts\n?? .kittify/derived/demo/status.json\n", stderr="")
+                raise AssertionError(command)
+
+            with mock.patch.object(spec_backend.subprocess, "run", side_effect=fake_run):
+                result = spec_backend.integrate_approved_lanes(repo, "001-demo", execute=True)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(" M src/app.ts", result["dirty"])
+        self.assertNotIn("?? .kittify/derived/demo/status.json", result["dirty"])
+
+    def test_ensure_spec_kitty_import_path_uses_cli_shebang(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "tool" / "bin"
+            package_dir = root / "tool" / "lib" / "python3.11" / "site-packages" / "specify_cli"
+            bin_dir.mkdir(parents=True)
+            package_dir.mkdir(parents=True)
+            fake_python = bin_dir / "python3"
+            fake_python.write_text("", encoding="utf-8")
+            spec_kitty = bin_dir / "spec-kitty"
+            spec_kitty.write_text(f"#!{fake_python}\n", encoding="utf-8")
+            spec_kitty.chmod(0o755)
+            (package_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+            old_path = list(sys.path)
+            sys.modules.pop("specify_cli", None)
+            with mock.patch.object(spec_backend.shutil, "which", return_value=str(spec_kitty)):
+                ok = spec_backend.ensure_spec_kitty_import_path()
+
+            self.assertTrue(ok)
+            self.assertIn(str(package_dir.parent), sys.path)
+            sys.modules.pop("specify_cli", None)
+            sys.path[:] = old_path
 
 
 if __name__ == "__main__":

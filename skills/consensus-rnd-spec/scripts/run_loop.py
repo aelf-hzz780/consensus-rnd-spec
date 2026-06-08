@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -39,8 +41,12 @@ def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def codex_base_command(repo: Path) -> list[str]:
+    return ["codex", "exec", "--cd", str(repo), "--dangerously-bypass-approvals-and-sandbox"]
+
+
 def codex_command(repo: Path, prompt_file: str, config) -> list[str]:
-    command = ["codex", "exec", "--cd", str(repo), "--ask-for-approval", "never"]
+    command = codex_base_command(repo)
     if config.codex_model:
         command.extend(["--model", config.codex_model])
     if config.codex_extra_args:
@@ -50,7 +56,7 @@ def codex_command(repo: Path, prompt_file: str, config) -> list[str]:
 
 
 def codex_prompt_command(repo: Path, prompt_text: str, config) -> list[str]:
-    command = ["codex", "exec", "--cd", str(repo), "--ask-for-approval", "never"]
+    command = codex_base_command(repo)
     if config.codex_model:
         command.extend(["--model", config.codex_model])
     if config.codex_extra_args:
@@ -59,8 +65,70 @@ def codex_prompt_command(repo: Path, prompt_text: str, config) -> list[str]:
     return command
 
 
+def unattended_worker_prompt(prompt_text: str) -> str:
+    return (
+        "You are running inside an unattended consensus-rnd-spec worker. "
+        "The human already approved execution of this loop. Do not stop after producing a plan, "
+        "do not ask for confirmation, and do not end until you have performed the requested work, "
+        "run relevant verification, committed any required implementation changes, and completed "
+        "the Spec Kitty status commands from the prompt. The process working directory is set to "
+        "the Spec Kitty workspace shown in the prompt, so relative edits must stay in that "
+        "workspace. If the work cannot be completed, return "
+        "a clear failure with the blocker instead of reporting success.\n\n"
+        f"{prompt_text}"
+    )
+
+
+def worker_workspace_from_prompt(repo: Path, prompt_text: str) -> Path:
+    for raw_line in prompt_text.splitlines():
+        line = raw_line.strip()
+        candidate = ""
+        if line.startswith("Workspace:"):
+            candidate = line.split(":", 1)[1].strip()
+        elif "Workspace:" in line:
+            candidate = line.split("Workspace:", 1)[1].strip()
+        if candidate.startswith("cd "):
+            candidate = candidate[3:].strip()
+        if not candidate:
+            continue
+        candidate = candidate.strip("`\"'")
+        path = Path(candidate).expanduser()
+        if path.is_absolute() and path.is_dir():
+            return path
+    return repo
+
+
+def spec_kitty_site_packages() -> str:
+    executable = shutil.which("spec-kitty")
+    if not executable:
+        return ""
+    try:
+        first_line = Path(executable).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+    except (OSError, IndexError):
+        return ""
+    if not first_line.startswith("#!"):
+        return ""
+    interpreter = Path(first_line[2:].strip().split()[0])
+    root = interpreter.parent.parent
+    for candidate in sorted((root / "lib").glob("python*/site-packages")):
+        if (candidate / "specify_cli").is_dir():
+            return str(candidate)
+    return ""
+
+
+def command_env() -> dict[str, str]:
+    env = dict(os.environ)
+    site_packages = spec_kitty_site_packages()
+    if site_packages:
+        current = env.get("PYTHONPATH", "")
+        parts = [part for part in current.split(os.pathsep) if part]
+        if site_packages not in parts:
+            env["PYTHONPATH"] = os.pathsep.join([site_packages, *parts])
+    return env
+
+
 def run_command(command: list[str], repo: Path) -> dict[str, Any]:
-    result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+    result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False, env=command_env())
     return {
         "command": command,
         "returncode": result.returncode,
@@ -73,6 +141,38 @@ def worker_result_value(result: dict[str, Any]) -> str:
     if result.get("returncode") == 0:
         return "success"
     return "failed"
+
+
+NEXT_STEP_REQUIRED_ARTIFACTS = {
+    "research": (
+        "research.md",
+        "data-model.md",
+        "research/evidence-log.csv",
+        "research/source-register.csv",
+    ),
+}
+
+
+def verify_next_step_worker_completion(
+    repo: Path,
+    plan: dict[str, Any],
+    decision_payload: dict[str, Any],
+    worker_result: dict[str, Any],
+) -> tuple[bool, str]:
+    if worker_result.get("returncode") != 0:
+        return False, "worker exited non-zero"
+    action = str(decision_payload.get("action") or plan.get("action") or "")
+    required = NEXT_STEP_REQUIRED_ARTIFACTS.get(action)
+    if not required:
+        return True, ""
+    mission = str(decision_payload.get("mission_slug") or plan_mission(plan) or "")
+    if not mission:
+        return False, "missing mission_slug for next-step artifact verification"
+    mission_path = repo / "kitty-specs" / mission
+    missing_or_empty = [item for item in required if not (mission_path / item).is_file() or (mission_path / item).stat().st_size == 0]
+    if missing_or_empty:
+        return False, f"worker did not create required {action} artifacts: {', '.join(missing_or_empty)}"
+    return True, ""
 
 
 def record_worker_pending(repo: Path, plan: dict[str, Any], worker_result: dict[str, Any], *, action: str | None = None) -> dict[str, Any]:
@@ -111,6 +211,35 @@ def wp_phase_for_action(action: str | None) -> str:
     return PHASE_IMPLEMENTING
 
 
+def wp_lane(repo: Path, mission: str, wp_id: str) -> str:
+    state = run_command(["spec-kitty", "orchestrator-api", "mission-state", "--mission", mission], repo)
+    try:
+        payload = json.loads(state.get("stdout_tail") or "{}")
+    except json.JSONDecodeError:
+        return ""
+    packages = payload.get("data", {}).get("work_packages", [])
+    if not isinstance(packages, list):
+        return ""
+    for package in packages:
+        if isinstance(package, dict) and package.get("wp_id") == wp_id:
+            lane = package.get("lane")
+            return str(lane) if lane else ""
+    return ""
+
+
+def kitty_agent_worker_success(repo: Path, mission: str, wp_id: str, action: str, worker_result: dict[str, Any]) -> bool:
+    if worker_result.get("returncode") != 0:
+        return False
+    if not mission or not wp_id:
+        return False
+    lane = wp_lane(repo, mission, wp_id)
+    if action == "implement":
+        return lane == "for_review"
+    if action == "review":
+        return lane in {"approved", "done"}
+    return True
+
+
 def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[str, Any]:
     if plan.get("status") == "discovery_needed":
         promotion = promote_discovery(repo, execute=False)
@@ -136,14 +265,28 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
         worker_command = codex_command(repo, str(prompt_file), config)
         worker_result = run_command(worker_command, repo)
         pending_plan = {**plan, "decision": {"payload": decision_payload}}
-        pending = record_worker_pending(repo, pending_plan, worker_result, action=decision_payload.get("action"))
+        worker_completed, incomplete_reason = verify_next_step_worker_completion(repo, plan, decision_payload, worker_result)
+        effective_worker_result = dict(worker_result)
+        exited_zero_without_completion = not worker_completed and worker_result.get("returncode") == 0
+        if not worker_completed and worker_result.get("returncode") == 0:
+            effective_worker_result["returncode"] = 1
+            effective_worker_result["stderr_tail"] = (
+                effective_worker_result.get("stderr_tail", "")
+                + f"\nWorker exited 0 but did not complete the Spec Kitty {decision_payload.get('action') or plan.get('action')} step: {incomplete_reason}."
+            )
+        pending = (
+            record_worker_pending(repo, pending_plan, effective_worker_result, action=decision_payload.get("action"))
+            if worker_completed or not exited_zero_without_completion
+            else {"status": "not-recorded", "reason": incomplete_reason}
+        )
         return {
-            "status": "worker-finished",
+            "status": "worker-finished" if worker_completed else "worker-incomplete",
             "execution_kind": execution_kind,
             "advance_result": advance_result,
             "decision": decision_payload,
-            "worker_result": worker_result,
+            "worker_result": effective_worker_result,
             "pending_result": pending,
+            "worker_completed": worker_completed,
         }
 
     if execution_kind == "kitty-prompt-file":
@@ -158,6 +301,16 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
     action_command = plan.get("action_command")
     if not action_command:
         return {"status": "noop", "reason": "no actionable Spec Kitty command"}
+    if plan.get("execution_kind") == "kitty-agent-action":
+        mission = plan_mission(plan)
+        if mission:
+            github_children = ensure_child_issues(repo, mission, execute=True)
+            if github_children.get("status") not in {"ready", "created", "disabled"}:
+                return {
+                    "status": "blocked",
+                    "reason": "GitHub child issue sync failed before Spec Kitty action",
+                    "github_children": github_children,
+                }
     action_result = run_command(action_command, repo)
     if execution_kind == "kitty-agent-action":
         mission = plan_mission(plan)
@@ -198,28 +351,45 @@ def execute_spec_kitty_action(repo: Path, plan: dict[str, Any], config) -> dict[
                     "action_result": action_result,
                     "github_before": github_before,
                 }
-        worker_command = codex_prompt_command(repo, prompt_text, config)
-        worker_result = run_command(worker_command, repo)
-        pending = record_worker_pending(repo, plan, worker_result)
+        worker_workspace = worker_workspace_from_prompt(repo, prompt_text)
+        worker_command = codex_prompt_command(worker_workspace, unattended_worker_prompt(prompt_text), config)
+        worker_result = run_command(worker_command, worker_workspace)
+        worker_completed = kitty_agent_worker_success(repo, mission, wp_id, action, worker_result)
+        effective_worker_result = dict(worker_result)
+        exited_zero_without_transition = not worker_completed and worker_result.get("returncode") == 0
+        if not worker_completed and worker_result.get("returncode") == 0:
+            effective_worker_result["returncode"] = 1
+            effective_worker_result["stderr_tail"] = (
+                effective_worker_result.get("stderr_tail", "")
+                + "\nWorker exited 0 but did not complete the Spec Kitty WP status transition."
+            )
+        pending = (
+            record_worker_pending(repo, plan, effective_worker_result)
+            if worker_completed or (effective_worker_result.get("returncode") != 0 and not exited_zero_without_transition)
+            else {"status": "not-recorded", "reason": "worker did not complete WP"}
+        )
         if mission and wp_id:
             github_after = sync_wp_status(
                 repo,
                 mission,
                 wp_id,
-                PHASE_REVIEWING if action == "implement" and worker_result.get("returncode") == 0 else wp_phase_for_action(action),
-                detail=f"Spec Kitty {action or 'agent'} worker completed with returncode {worker_result.get('returncode')}.",
+                PHASE_REVIEWING if action == "implement" and worker_completed else wp_phase_for_action(action),
+                detail=f"Spec Kitty {action or 'agent'} worker completed with returncode {effective_worker_result.get('returncode')}.",
                 execute=True,
             )
-            github_pr = open_or_update_mission_pr(repo, mission, execute=True)
+            if worker_completed:
+                github_pr = open_or_update_mission_pr(repo, mission, execute=True)
         return {
-            "status": "worker-finished",
+            "status": "worker-finished" if worker_completed else "worker-incomplete",
             "execution_kind": execution_kind,
             "action_result": action_result,
-            "worker_result": worker_result,
+            "worker_result": effective_worker_result,
+            "worker_workspace": str(worker_workspace),
             "pending_result": pending,
             "github_before": github_before,
             "github_after": github_after,
             "github_pr": github_pr,
+            "worker_completed": worker_completed,
         }
     decision_payload = plan.get("decision", {}).get("payload", {})
     prompt_file = decision_payload.get("prompt_file")
