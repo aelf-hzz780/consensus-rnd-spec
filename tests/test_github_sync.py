@@ -49,6 +49,22 @@ def make_mission(repo: Path, mission: str = "001-demo", *, source_issue: str = "
     return mission_dir
 
 
+def write_wp_status(mission_dir: Path, lanes: dict[str, str]) -> None:
+    mission_slug = mission_dir.name
+    payload = {
+        "mission_slug": mission_slug,
+        "work_packages": {
+            wp_id: {"lane": lane, "actor": "test"}
+            for wp_id, lane in lanes.items()
+        },
+        "summary": {
+            lane: list(lanes.values()).count(lane)
+            for lane in sorted(set(lanes.values()))
+        },
+    }
+    (mission_dir / "status.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
 class GitHubSyncTests(unittest.TestCase):
     def test_run_command_retries_transient_gh_eof(self) -> None:
         calls = 0
@@ -373,6 +389,7 @@ class GitHubSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             mission_dir = make_mission(repo, source_issue="42")
+            write_wp_status(mission_dir, {"WP01": "done", "WP02": "done"})
             github_sync.write_bindings(
                 mission_dir,
                 {
@@ -494,6 +511,216 @@ class GitHubSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "mission PR head must be a mission branch, not a WP lane branch")
         preflight.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_mark_merged_can_bind_verified_legacy_merged_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            write_wp_status(mission_dir, {"WP01": "done", "WP02": "done"})
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}, "WP02": {"number": "44"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                calls.append(command)
+                if command[:3] == ["gh", "pr", "view"]:
+                    payload = {
+                        "state": "MERGED",
+                        "mergedAt": "2026-06-06T19:49:20Z",
+                        "mergeCommit": {"oid": "ba7f0461888c07515bb7afa81985747df35ee91e"},
+                        "url": "https://github.com/owner/repo/pull/93",
+                        "headRefName": "codex/catch-up",
+                        "baseRefName": "feature/cockpit",
+                    }
+                    return github_sync.CommandResult(command, 0, json.dumps(payload), "")
+                if command[:3] == ["gh", "issue", "edit"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "issue", "close"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                if command[:3] == ["gh", "pr", "edit"]:
+                    return github_sync.CommandResult(command, 0, "", "")
+                raise AssertionError(command)
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}
+            ), mock.patch.object(github_sync, "run_command", side_effect=fake_run):
+                result = github_sync.mark_mission_merged(repo, "001-demo", merged_pr="93", execute=True)
+
+            bindings = json.loads((mission_dir / "consensus-rnd" / "github-bindings.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(bindings["mission_pr"]["number"], "93")
+        self.assertEqual(bindings["mission_pr"]["binding_source"], "verified-merged-pr-override")
+        self.assertEqual(bindings["mission_pr"]["merge_commit"], "ba7f0461888c07515bb7afa81985747df35ee91e")
+        self.assertEqual(bindings["child_issues"]["WP01"]["phase"], github_sync.PHASE_MERGED)
+        self.assertEqual(bindings["child_issues"]["WP02"]["phase"], github_sync.PHASE_MERGED)
+        self.assertIn("last_status_at", bindings["child_issues"]["WP01"])
+        self.assertTrue(any(command[:3] == ["gh", "issue", "close"] and command[3] == "42" for command in calls))
+        self.assertTrue(any(command[:3] == ["gh", "issue", "close"] and command[3] == "43" for command in calls))
+
+    def test_bind_merged_pr_records_verified_pr_without_closing_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                calls.append(command)
+                if command[:3] == ["gh", "pr", "view"]:
+                    payload = {
+                        "state": "MERGED",
+                        "mergedAt": "2026-06-06T19:49:20Z",
+                        "mergeCommit": {"oid": "ba7f0461888c07515bb7afa81985747df35ee91e"},
+                        "url": "https://github.com/owner/repo/pull/93",
+                        "headRefName": "codex/catch-up",
+                        "baseRefName": "feature/cockpit",
+                    }
+                    return github_sync.CommandResult(command, 0, json.dumps(payload), "")
+                raise AssertionError(command)
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}
+            ), mock.patch.object(github_sync, "run_command", side_effect=fake_run):
+                result = github_sync.bind_merged_pr(repo, "001-demo", merged_pr="93", execute=True)
+
+            bindings = json.loads((mission_dir / "consensus-rnd" / "github-bindings.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(bindings["mission_pr"]["number"], "93")
+        self.assertEqual(bindings["mission_pr"]["binding_source"], "verified-merged-pr-override")
+        self.assertEqual(bindings["mission_pr"]["merge_commit"], "ba7f0461888c07515bb7afa81985747df35ee91e")
+        self.assertEqual([command[:3] for command in calls], [["gh", "pr", "view"]])
+
+    def test_mark_merged_rejects_unmerged_legacy_pr_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            write_wp_status(mission_dir, {"WP01": "done"})
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                if command[:3] == ["gh", "pr", "view"]:
+                    return github_sync.CommandResult(
+                        command,
+                        0,
+                        json.dumps({"state": "OPEN", "mergedAt": "", "mergeCommit": None}),
+                        "",
+                    )
+                raise AssertionError(command)
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}
+            ), mock.patch.object(github_sync, "run_command", side_effect=fake_run):
+                result = github_sync.mark_mission_merged(repo, "001-demo", merged_pr="93", execute=True)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "mission PR is not merged; refusing to close issues")
+
+    def test_mark_merged_can_skip_reused_parent_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            write_wp_status(mission_dir, {"WP01": "done"})
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], _repo: Path) -> github_sync.CommandResult:
+                calls.append(command)
+                if command[:3] == ["gh", "pr", "view"]:
+                    payload = {
+                        "state": "MERGED",
+                        "mergedAt": "2026-06-06T19:49:20Z",
+                        "mergeCommit": {"oid": "ba7f0461888c07515bb7afa81985747df35ee91e"},
+                    }
+                    return github_sync.CommandResult(command, 0, json.dumps(payload), "")
+                if command[:3] in (["gh", "issue", "edit"], ["gh", "issue", "close"], ["gh", "pr", "edit"]):
+                    return github_sync.CommandResult(command, 0, "", "")
+                raise AssertionError(command)
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}
+            ), mock.patch.object(github_sync, "run_command", side_effect=fake_run):
+                result = github_sync.mark_mission_merged(repo, "001-demo", merged_pr="93", skip_parent=True, execute=True)
+
+            bindings = json.loads((mission_dir / "consensus-rnd" / "github-bindings.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "synced")
+        self.assertFalse(any(command[:3] == ["gh", "issue", "close"] and command[3] == "42" for command in calls))
+        self.assertTrue(any(command[:3] == ["gh", "issue", "close"] and command[3] == "43" for command in calls))
+        self.assertEqual(bindings["child_issues"]["WP01"]["phase"], github_sync.PHASE_MERGED)
+
+    def test_mark_merged_blocks_when_spec_kitty_wps_are_not_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            mission_dir = make_mission(repo, source_issue="42")
+            write_wp_status(mission_dir, {"WP01": "approved", "WP02": "done"})
+            github_sync.write_bindings(
+                mission_dir,
+                {
+                    "schema": "consensus-rnd-spec.github-bindings.v1",
+                    "parent_issue": {"number": "42"},
+                    "child_issues": {"WP01": {"number": "43"}, "WP02": {"number": "44"}},
+                    "mission_pr": {},
+                },
+            )
+            (repo / ".consensus-rnd-spec").mkdir()
+            (repo / ".consensus-rnd-spec" / "host.env").write_text(
+                f'export REPO_ROOT="{repo}"\nexport GH_REPO_SLUG="owner/repo"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                github_sync, "github_write_preflight", return_value={"status": "ready", "repo_slug": "owner/repo"}
+            ), mock.patch.object(github_sync, "run_command") as run_command:
+                result = github_sync.mark_mission_merged(repo, "001-demo", merged_pr="93", execute=False)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "Spec Kitty WPs are not done; refusing to close issues")
+        self.assertEqual(result["lane_guard"]["not_done"], [{"wp_id": "WP01", "kitty_lane": "approved"}])
         run_command.assert_not_called()
 
 

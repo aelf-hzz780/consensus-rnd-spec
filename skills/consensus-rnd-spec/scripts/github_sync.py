@@ -244,6 +244,18 @@ def record_wp_status_sync(mission_path: Path, wp_id: str, issue: str, phase: str
     return write_bindings(mission_path, bindings)
 
 
+def mark_child_issue_bindings_merged(bindings: dict[str, Any]) -> None:
+    child_issues = bindings.get("child_issues")
+    if not isinstance(child_issues, dict):
+        return
+    now = utc_now()
+    for child in child_issues.values():
+        if not isinstance(child, dict) or not child.get("number"):
+            continue
+        child["phase"] = PHASE_MERGED
+        child["last_status_at"] = now
+
+
 WP_PHASE_LANE_ALLOWLIST: dict[str, set[str]] = {
     PHASE_DESIGN_SOLVING: {"planned"},
     PHASE_CONSENSUS_REACHED: {"planned", "approved"},
@@ -284,6 +296,49 @@ def validate_wp_phase_against_kitty_lane(mission_path: Path, wp_id: str, phase: 
             "allowed_lanes": sorted(allowed),
         }
     return {"status": "ready", "wp_id": wp_id, "phase": phase, "kitty_lane": lane, "allowed_lanes": sorted(allowed)}
+
+
+def validate_mission_done_lanes(mission_path: Path, bindings: dict[str, Any]) -> dict[str, Any]:
+    """Require Spec Kitty done transitions before closing issue projections."""
+    status_path = mission_path / "status.json"
+    if not status_path.exists():
+        return {"status": "blocked", "reason": "missing Spec Kitty status.json; refusing to close issues"}
+    status = load_json(status_path)
+    work_packages = status.get("work_packages")
+    if not isinstance(work_packages, dict) or not work_packages:
+        return {"status": "blocked", "reason": "missing Spec Kitty WP status; refusing to close issues"}
+
+    child_issues = bindings.get("child_issues") if isinstance(bindings.get("child_issues"), dict) else {}
+    child_wp_ids = [
+        str(wp_id)
+        for wp_id, child in sorted(child_issues.items())
+        if isinstance(child, dict) and child.get("number")
+    ]
+    wp_ids = child_wp_ids or [str(wp_id) for wp_id in sorted(work_packages)]
+
+    lanes: list[dict[str, str]] = []
+    not_done: list[dict[str, str]] = []
+    for wp_id in wp_ids:
+        wp = work_packages.get(wp_id)
+        lane = ""
+        if isinstance(wp, dict):
+            lane_value = wp.get("lane")
+            if isinstance(lane_value, str):
+                lane = lane_value.strip()
+        entry = {"wp_id": wp_id, "kitty_lane": lane}
+        lanes.append(entry)
+        if lane != "done":
+            not_done.append(entry)
+
+    if not_done:
+        return {
+            "status": "blocked",
+            "reason": "Spec Kitty WPs are not done; refusing to close issues",
+            "required_lane": "done",
+            "not_done": not_done,
+            "lanes": lanes,
+        }
+    return {"status": "ready", "required_lane": "done", "lanes": lanes}
 
 
 def ensure_sentinel(body: str) -> str:
@@ -559,17 +614,29 @@ def parse_pr_number(text: str) -> str:
 
 
 def pr_view_command(number: str, repo_slug: str) -> list[str]:
-    return ["gh", "pr", "view", str(number), "--repo", repo_slug, "--json", "state,mergedAt,mergeCommit"]
+    return ["gh", "pr", "view", str(number), "--repo", repo_slug, "--json", "state,mergedAt,mergeCommit,url,headRefName,baseRefName"]
 
 
-def validate_mission_pr_merge_evidence(repo: Path, config: HostConfig, bindings: dict[str, Any], repo_slug: str, *, execute: bool) -> dict[str, Any]:
+def validate_mission_pr_merge_evidence(
+    repo: Path,
+    config: HostConfig,
+    bindings: dict[str, Any],
+    repo_slug: str,
+    *,
+    execute: bool,
+    merged_pr: str = "",
+) -> dict[str, Any]:
     mission_pr = bindings.get("mission_pr") if isinstance(bindings.get("mission_pr"), dict) else {}
-    number = str(mission_pr.get("number") or "")
+    number = str(merged_pr or mission_pr.get("number") or "")
     if not number:
         return {"status": "blocked", "reason": "missing mission PR binding; refusing to close issues without merged PR evidence"}
     command = pr_view_command(number, repo_slug)
     if not execute:
-        return {"status": "ready", "mission_pr": mission_pr, "merge_evidence_command": command}
+        planned_pr = dict(mission_pr)
+        if merged_pr:
+            planned_pr["number"] = str(merged_pr)
+            planned_pr["binding_source"] = "verified-merged-pr-override"
+        return {"status": "ready", "mission_pr": planned_pr, "merge_evidence_command": command}
     result = run_command(command, config.repo_root)
     if result.returncode != 0:
         return {"status": "blocked", "reason": "failed to read mission PR merge evidence", "mission_pr": mission_pr, "result": result.as_dict()}
@@ -591,8 +658,28 @@ def validate_mission_pr_merge_evidence(repo: Path, config: HostConfig, bindings:
             "has_merge_commit": has_merge_commit,
             "result": result.as_dict(),
         }
-    evidence = {"state": state, "merged_at": merged_at, "merge_commit": str(merge_commit.get("oid")), "result": result.as_dict()}
-    return {"status": "ready", "mission_pr": mission_pr, "merge_evidence": evidence}
+    verified_pr = dict(mission_pr)
+    verified_pr["number"] = number
+    if payload.get("url"):
+        verified_pr["url"] = str(payload.get("url"))
+    if payload.get("headRefName"):
+        verified_pr["head"] = str(payload.get("headRefName"))
+    if payload.get("baseRefName"):
+        verified_pr["base"] = str(payload.get("baseRefName"))
+    if merged_pr:
+        verified_pr["binding_source"] = "verified-merged-pr-override"
+    verified_pr["merged_at"] = merged_at
+    verified_pr["merge_commit"] = str(merge_commit.get("oid"))
+    evidence = {
+        "state": state,
+        "merged_at": merged_at,
+        "merge_commit": str(merge_commit.get("oid")),
+        "url": str(payload.get("url") or ""),
+        "head": str(payload.get("headRefName") or ""),
+        "base": str(payload.get("baseRefName") or ""),
+        "result": result.as_dict(),
+    }
+    return {"status": "ready", "mission_pr": verified_pr, "merge_evidence": evidence}
 
 
 def resolve_repo_slug(repo: Path, config: HostConfig, *, execute: bool) -> dict[str, Any]:
@@ -1263,7 +1350,7 @@ def open_or_update_mission_pr(repo: Path, mission: str, *, head_override: str = 
     return {"status": "ready", "mission_pr": bindings["mission_pr"], "results": results, "bindings_path": str(out)}
 
 
-def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> dict[str, Any]:
+def mark_mission_merged(repo: Path, mission: str, *, merged_pr: str = "", skip_parent: bool = False, execute: bool = False) -> dict[str, Any]:
     config = load_config(repo)
     path = mission_dir(config.repo_root, mission)
     bindings = load_bindings(path)
@@ -1271,15 +1358,25 @@ def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> d
     if preflight.get("status") in {"disabled", "blocked"}:
         return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
     repo_slug = planned_repo_slug(preflight, config)
-    evidence = validate_mission_pr_merge_evidence(config.repo_root, config, bindings, repo_slug, execute=execute)
+    lane_guard = validate_mission_done_lanes(path, bindings)
+    if lane_guard.get("status") == "blocked":
+        return {"status": "blocked", "reason": lane_guard.get("reason"), "preflight": preflight, "lane_guard": lane_guard}
+    evidence = validate_mission_pr_merge_evidence(config.repo_root, config, bindings, repo_slug, execute=execute, merged_pr=merged_pr)
     if evidence.get("status") in {"disabled", "blocked"}:
-        return {"status": evidence["status"], "reason": evidence.get("reason"), "preflight": preflight, "merge_evidence": evidence}
+        return {
+            "status": evidence["status"],
+            "reason": evidence.get("reason"),
+            "preflight": preflight,
+            "lane_guard": lane_guard,
+            "merge_evidence": evidence,
+        }
     commands: list[list[str]] = []
     parent_issue = str(bindings.get("parent_issue", {}).get("number") or "")
-    if parent_issue:
+    if parent_issue and not skip_parent:
         commands.append(label_edit_command("issue", parent_issue, repo_slug, PHASE_MERGED))
         commands.append(["gh", "issue", "close", parent_issue, "--repo", repo_slug])
-    mission_pr = str(bindings.get("mission_pr", {}).get("number") or "")
+    evidence_pr = evidence.get("mission_pr") if isinstance(evidence.get("mission_pr"), dict) else {}
+    mission_pr = str(evidence_pr.get("number") or bindings.get("mission_pr", {}).get("number") or "")
     if mission_pr:
         commands.append(label_edit_command("pr", mission_pr, repo_slug, PHASE_MERGED))
     for child in (bindings.get("child_issues") or {}).values():
@@ -1287,13 +1384,55 @@ def mark_mission_merged(repo: Path, mission: str, *, execute: bool = False) -> d
             commands.append(label_edit_command("issue", str(child["number"]), repo_slug, PHASE_MERGED))
             commands.append(["gh", "issue", "close", str(child["number"]), "--repo", repo_slug])
     if not execute:
-        return {"status": "planned", "commands": commands, "merge_evidence": evidence}
+        return {"status": "planned", "commands": commands, "lane_guard": lane_guard, "merge_evidence": evidence}
     results = [run_command(command, config.repo_root).as_dict() for command in commands]
     if any(result["returncode"] != 0 for result in results):
         return {"status": "blocked", "reason": "failed to mark mission merged", "results": results}
-    append_event(bindings, {"kind": "mission-merged", "merge_evidence": evidence.get("merge_evidence", {})})
+    if evidence_pr:
+        bindings["mission_pr"] = evidence_pr
+    mark_child_issue_bindings_merged(bindings)
+    append_event(
+        bindings,
+        {
+            "kind": "mission-merged",
+            "merge_evidence": evidence.get("merge_evidence", {}),
+            "merged_pr_override": str(merged_pr or ""),
+            "parent_skipped": bool(skip_parent),
+        },
+    )
     out = write_bindings(path, bindings)
-    return {"status": "synced", "results": results, "bindings_path": str(out), "merge_evidence": evidence}
+    return {"status": "synced", "results": results, "bindings_path": str(out), "lane_guard": lane_guard, "merge_evidence": evidence}
+
+
+def bind_merged_pr(repo: Path, mission: str, *, merged_pr: str, execute: bool = False) -> dict[str, Any]:
+    """Bind a verified merged PR without closing issues or changing phase labels."""
+    config = load_config(repo)
+    path = mission_dir(config.repo_root, mission)
+    bindings = load_bindings(path)
+    preflight = github_write_preflight(config.repo_root, config, execute=execute)
+    if preflight.get("status") in {"disabled", "blocked"}:
+        return {"status": preflight["status"], "reason": preflight.get("reason"), "preflight": preflight}
+    if not str(merged_pr or "").strip():
+        return {"status": "blocked", "reason": "--merged-pr is required for bind-merged-pr", "preflight": preflight}
+    repo_slug = planned_repo_slug(preflight, config)
+    evidence = validate_mission_pr_merge_evidence(config.repo_root, config, bindings, repo_slug, execute=execute, merged_pr=merged_pr)
+    if evidence.get("status") in {"disabled", "blocked"}:
+        return {"status": evidence["status"], "reason": evidence.get("reason"), "preflight": preflight, "merge_evidence": evidence}
+    evidence_pr = evidence.get("mission_pr") if isinstance(evidence.get("mission_pr"), dict) else {}
+    if not execute:
+        return {"status": "planned", "preflight": preflight, "mission_pr": evidence_pr, "merge_evidence": evidence}
+    bindings["mission_pr"] = evidence_pr
+    append_event(
+        bindings,
+        {
+            "kind": "merged-pr-bound",
+            "merge_evidence": evidence.get("merge_evidence", {}),
+            "merged_pr_override": str(merged_pr or ""),
+            "issues_closed": False,
+        },
+    )
+    out = write_bindings(path, bindings)
+    return {"status": "synced", "bindings_path": str(out), "mission_pr": evidence_pr, "merge_evidence": evidence}
 
 
 def source_contract() -> dict[str, Any]:
@@ -1350,9 +1489,16 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--mission", required=True)
     pr.add_argument("--head", default="")
     pr.add_argument("--execute", action="store_true")
+    bind_pr = sub.add_parser("bind-merged-pr")
+    bind_pr.add_argument("--repo", default=".")
+    bind_pr.add_argument("--mission", required=True)
+    bind_pr.add_argument("--merged-pr", required=True, help="Verified merged PR number to bind without closing issues.")
+    bind_pr.add_argument("--execute", action="store_true")
     merged = sub.add_parser("mark-merged")
     merged.add_argument("--repo", default=".")
     merged.add_argument("--mission", required=True)
+    merged.add_argument("--merged-pr", default="", help="Verified merged PR number to bind before closing legacy/catch-up mission projection.")
+    merged.add_argument("--skip-parent", action="store_true", help="Do not close the parent issue; useful when a source issue is reused by later missions.")
     merged.add_argument("--execute", action="store_true")
     contract = sub.add_parser("contract")
     contract.add_argument("--repo", default=".")
@@ -1383,8 +1529,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "open-pr":
         result = open_or_update_mission_pr(repo, args.mission, head_override=args.head, execute=args.execute)
+    elif args.command == "bind-merged-pr":
+        result = bind_merged_pr(repo, args.mission, merged_pr=args.merged_pr, execute=args.execute)
     elif args.command == "mark-merged":
-        result = mark_mission_merged(repo, args.mission, execute=args.execute)
+        result = mark_mission_merged(repo, args.mission, merged_pr=args.merged_pr, skip_parent=args.skip_parent, execute=args.execute)
     else:
         result = source_contract()
     print_json(result)
